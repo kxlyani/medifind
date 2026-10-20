@@ -1,0 +1,28 @@
+# Pharmacy Simulator: 20 fake pharmacies sending stock updates forever.
+# Change RATE to send more/fewer updates per second, or scale to 0 to pause:
+#   kubectl -n medifind scale deployment simulator --replicas=0
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: simulator
+  namespace: medifind
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: simulator }
+  template:
+    metadata:
+      labels: { app: simulator }
+    spec:
+      containers:
+        - name: simulator
+          image: medifind/simulator:1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: PHARMACY_URL, value: "http://pharmacy-service:8003" }
+            - { name: SEARCH_URL, value: "http://search-service:8002" }
+            - { name: PHARMACIES, value: "20" }
+            - { name: RATE, value: "2" }
+          resources:
+            requests: { cpu: 25m, memory: 32Mi }
+            limits:   { cpu: 200m, memory: 64Mi }

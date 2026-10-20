@@ -1,0 +1,139 @@
+# MediFind - full system on Docker Compose (used for local development)
+#
+#   Start:      docker compose up --build
+#   Web app:    http://localhost:8080
+#   RabbitMQ:   http://localhost:15672   (login medifind / medifind)
+#   API docs:   http://localhost:8002/docs (search), http://localhost:8003/docs (pharmacy)
+#   Stop:       docker compose down        (add -v to also reset the database)
+#
+# Try running several consumers (competing consumers):
+#   docker compose up -d --scale inventory-consumer=3
+# Bully algorithm: stop the leader and watch the others elect a new one:
+#   docker compose stop coordinator-3     then    docker compose logs -f coordinator-1 coordinator-2
+#   docker compose start coordinator-3    (it bullies its way back to leader)
+# Mutual exclusion race demo:
+#   python demo/race_test.py --url http://localhost:8080
+
+x-common-env: &common-env
+  DB_HOST: postgres
+  DB_NAME: medifind
+  DB_USER: medifind
+  DB_PASSWORD: medifind
+  RABBITMQ_HOST: rabbitmq
+  RABBITMQ_USER: medifind
+  RABBITMQ_PASSWORD: medifind
+  REDIS_HOST: redis
+  COORDINATOR_PEERS: "1=coordinator-1:9000,2=coordinator-2:9000,3=coordinator-3:9000"
+
+x-coordinator: &coordinator
+  build: ./coordinator
+  restart: "no"
+
+services:
+  # ---------- infrastructure ----------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: medifind
+      POSTGRES_USER: medifind
+      POSTGRES_PASSWORD: medifind
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    # No host port: other containers reach it as "postgres:5432" on Docker's network.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U medifind -d medifind"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine   # includes the web dashboard
+    environment:
+      RABBITMQ_DEFAULT_USER: medifind
+      RABBITMQ_DEFAULT_PASS: medifind
+    ports: ["15672:15672"]     # only the web dashboard is opened to your computer
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    # No host port: other containers reach it as "redis:6379" on Docker's network.
+
+  # ---------- coordinator cluster (RPC + beacon + bully + lock manager) ----------
+  coordinator-1:
+    <<: *coordinator
+    environment:
+      NODE_ID: "1"
+      PEERS: "1=coordinator-1:9000,2=coordinator-2:9000,3=coordinator-3:9000"
+  coordinator-2:
+    <<: *coordinator
+    environment:
+      NODE_ID: "2"
+      PEERS: "1=coordinator-1:9000,2=coordinator-2:9000,3=coordinator-3:9000"
+  coordinator-3:
+    <<: *coordinator
+    environment:
+      NODE_ID: "3"
+      PEERS: "1=coordinator-1:9000,2=coordinator-2:9000,3=coordinator-3:9000"
+
+  # ---------- application services ----------
+  inventory-service:
+    build: ./inventory-service
+    environment:
+      <<: *common-env
+      CRITICAL_SECTION_DELAY_MS: "50"
+    deploy:
+      replicas: 2              # two copies, so the lock must work ACROSS processes
+    depends_on:
+      postgres: { condition: service_healthy }
+      coordinator-1: { condition: service_started }
+      coordinator-2: { condition: service_started }
+      coordinator-3: { condition: service_started }
+
+  inventory-consumer:
+    build: ./inventory-service          # same image as the Inventory API...
+    command: ["python", "-u", "consumer.py"]   # ...but runs the consumer instead
+    environment:
+      <<: *common-env
+      PROCESS_DELAY_MS: "0"
+    depends_on:
+      postgres: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      redis: { condition: service_started }
+
+  search-service:
+    build: ./search-service
+    environment:
+      INVENTORY_URL: http://inventory-service:8001
+      REDIS_HOST: redis
+      CACHE_TTL: "30"
+    ports: ["8002:8002"]
+    depends_on: [inventory-service, redis]
+
+  pharmacy-service:
+    build: ./pharmacy-service
+    environment: *common-env
+    ports: ["8003:8003"]
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+
+  frontend:
+    build: ./frontend
+    ports: ["8080:80"]
+    depends_on: [search-service, inventory-service, pharmacy-service]
+
+  simulator:
+    build: ./simulator
+    environment:
+      PHARMACY_URL: http://pharmacy-service:8003
+      SEARCH_URL: http://search-service:8002
+      PHARMACIES: "20"
+      RATE: "2"
+    depends_on: [pharmacy-service, search-service]
+
+volumes:
+  pgdata:

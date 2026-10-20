@@ -1,0 +1,74 @@
+# Inventory has TWO deployments built from the SAME image:
+#   inventory-service  -> REST API (stock queries, reservations with distributed lock)
+#   inventory-consumer -> reads events from RabbitMQ and saves them
+# Splitting them lets us scale each part independently.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inventory-service
+  namespace: medifind
+spec:
+  replicas: 2                    # two copies: reservations need a lock that works ACROSS pods
+  selector:
+    matchLabels: { app: inventory-service }
+  template:
+    metadata:
+      labels: { app: inventory-service }
+    spec:
+      containers:
+        - name: inventory-service
+          image: medifind/inventory-service:1.0
+          imagePullPolicy: IfNotPresent      # use the image built inside Minikube
+          ports: [{ containerPort: 8001 }]
+          envFrom:
+            - configMapRef: { name: medifind-config }
+            - secretRef: { name: medifind-secret }
+          readinessProbe:                    # only send traffic once the DB is reachable
+            httpGet: { path: /health, port: 8001 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:                     # restart the pod if it stops responding
+            httpGet: { path: /health, port: 8001 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inventory-service
+  namespace: medifind
+spec:
+  selector: { app: inventory-service }
+  ports: [{ port: 8001, targetPort: 8001 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inventory-consumer
+  namespace: medifind
+spec:
+  replicas: 2                    # two competing consumers share the queue
+  selector:
+    matchLabels: { app: inventory-consumer }
+  template:
+    metadata:
+      labels: { app: inventory-consumer }
+    spec:
+      containers:
+        - name: inventory-consumer
+          image: medifind/inventory-service:1.0
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-u", "consumer.py"]
+          envFrom:
+            - configMapRef: { name: medifind-config }
+            - secretRef: { name: medifind-secret }
+          env:
+            - name: PROCESS_DELAY_MS   # raise (e.g. 200) to make the queue fill up in the demo
+              value: "0"
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 250m, memory: 128Mi }

@@ -1,0 +1,42 @@
+# Pharmacy Service: receives stock updates and publishes them to RabbitMQ.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pharmacy-service
+  namespace: medifind
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: pharmacy-service }
+  template:
+    metadata:
+      labels: { app: pharmacy-service }
+    spec:
+      containers:
+        - name: pharmacy-service
+          image: medifind/pharmacy-service:1.0
+          imagePullPolicy: IfNotPresent
+          ports: [{ containerPort: 8003 }]
+          envFrom:
+            - configMapRef: { name: medifind-config }
+            - secretRef: { name: medifind-secret }
+          readinessProbe:
+            httpGet: { path: /health, port: 8003 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: 8003 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 250m, memory: 128Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pharmacy-service
+  namespace: medifind
+spec:
+  selector: { app: pharmacy-service }
+  ports: [{ port: 8003, targetPort: 8003 }]

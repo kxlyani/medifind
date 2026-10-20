@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MediFind</title>
+<style>
+  /* Archivo (SIL Open Font License, see fonts/OFL-LICENSE.txt), bundled so the
+     app looks the same without internet access. One variable file covers all
+     widths (condensed headings) and weights. */
+  @font-face {
+    font-family: "Archivo";
+    src: url("fonts/archivo.woff2") format("woff2");
+    font-weight: 100 900;
+    font-stretch: 62% 125%;
+    font-display: swap;
+  }
+  :root {
+    --paper: #eef2f0;       /* cool clinical paper */
+    --sheet: #ffffff;
+    --ink: #1c2b27;         /* deep green ink */
+    --muted: #5b6b66;
+    --rule: #c3cec9;
+    --cross: #0e8a55;       /* pharmacy-sign green */
+    --cross-dark: #0a6b42;
+    --cross-soft: #dcefe5;
+    --foil: #dde3e5;        /* blister foil */
+    --foil-edge: #b6c0c3;
+    --pocket-empty: #c9d1d4;
+    --low: #c2412d;
+    --low-soft: #fbe7e3;
+    --font: "Archivo", "Arial Narrow", Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; background: var(--paper); color: var(--ink); font-family: var(--font);
+         font-size: 16px; line-height: 1.5; font-variation-settings: "wdth" 100; }
+  .wrap { max-width: 920px; margin: 0 auto; padding: 0 16px; }
+  :focus-visible { outline: 3px solid var(--cross); outline-offset: 2px; border-radius: 4px; }
+
+  /* ---------- header ---------- */
+  .top { display: flex; align-items: center; justify-content: space-between; gap: 16px;
+         padding: 22px 0 0; flex-wrap: wrap; }
+  .brand { display: flex; align-items: center; gap: 10px; font-size: 1.35rem; font-weight: 800;
+           font-variation-settings: "wdth" 75; letter-spacing: .01em; color: var(--ink); text-decoration: none; }
+  .cross { position: relative; width: 22px; height: 22px; flex: none; }
+  .cross::before, .cross::after { content: ""; position: absolute; background: var(--cross); border-radius: 2px; }
+  .cross::before { left: 7px; top: 0; width: 8px; height: 22px; }
+  .cross::after { top: 7px; left: 0; width: 22px; height: 8px; }
+  .top p { margin: 0; color: var(--muted); font-size: .95rem; }
+
+  /* ---------- the question ---------- */
+  .ask { margin: 44px 0 0; font-size: clamp(1.7rem, 4.6vw, 2.9rem); line-height: 1.15;
+         font-weight: 700; font-variation-settings: "wdth" 72; }
+  .ask .line { display: flex; align-items: baseline; flex-wrap: wrap; gap: .25em .4em; }
+  .ask .line + .line { margin-top: .2em; }
+  .ask label { color: var(--muted); font-weight: 600; }
+  .ask input, .ask select {
+    font: inherit; font-variation-settings: inherit; color: var(--ink); background: transparent;
+    border: 0; border-bottom: 3px solid var(--ink); border-radius: 0; padding: 0 .1em .04em; min-width: 0;
+  }
+  .ask input { flex: 1 1 8em; }
+  .ask input::placeholder { color: #9aa8a3; }
+  .ask select { appearance: none; -webkit-appearance: none; cursor: pointer; padding-right: 1.1em;
+    background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 9'%3E%3Cpath d='M1.5 1.5 7 7l5.5-5.5' fill='none' stroke='%231c2b27' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+                right .1em center / .5em auto no-repeat; }
+  .ask select option { font-size: 1rem; }
+  .ask input:focus-visible, .ask select:focus-visible { outline: none; border-bottom-color: var(--cross); }
+  .find { font: inherit; font-size: 1rem; font-weight: 700; font-variation-settings: "wdth" 90;
+          background: var(--cross); color: #fff; border: 0; border-radius: 999px; padding: 12px 26px;
+          cursor: pointer; margin-left: auto; align-self: center; }
+  .find:hover { background: var(--cross-dark); }
+
+  .live { display: inline-flex; align-items: center; gap: 10px; margin-top: 22px; color: var(--muted);
+          font-size: .95rem; cursor: pointer; user-select: none; }
+  .live input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  .switch { width: 38px; height: 22px; border-radius: 999px; background: var(--rule); position: relative; transition: background .2s; flex: none; }
+  .switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%;
+                   background: #fff; transition: transform .2s; }
+  .live input:checked + .switch { background: var(--cross); }
+  .live input:checked + .switch::after { transform: translateX(16px); }
+  .live input:focus-visible + .switch { outline: 3px solid var(--cross); outline-offset: 2px; }
+
+  /* ---------- status + receipt ---------- */
+  .status { margin: 40px 0 0; min-height: 1.5em; }
+  .status b { font-weight: 700; }
+  .status .how { display: block; color: var(--muted); font-size: .88rem; margin-top: 2px; }
+  .receipt { display: none; margin-top: 18px; background: var(--sheet); border-left: 5px solid var(--cross);
+             padding: 14px 16px; border-radius: 0 6px 6px 0; }
+  .receipt.show { display: block; }
+  .receipt.bad { border-left-color: var(--low); background: var(--low-soft); }
+  .receipt strong { display: block; font-size: 1.05rem; }
+  .receipt span { color: var(--muted); font-size: .9rem; }
+
+  /* ---------- results: strips separated by perforations ---------- */
+  .results { list-style: none; margin: 18px 0 0; padding: 4px 20px; background: var(--sheet); border-radius: 10px; }
+  .results:empty { display: none; }
+  .row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 10px 22px;
+         padding: 18px 0; }
+  .row + .row { border-top: 2px dashed var(--rule); }
+  .who h3 { margin: 0; font-size: 1.15rem; font-weight: 700; font-variation-settings: "wdth" 80; line-height: 1.25; }
+  .who p { margin: 2px 0 0; color: var(--muted); font-size: .9rem; }
+  .stock { display: flex; align-items: center; gap: 12px; }
+  .count { font-size: .92rem; font-variant-numeric: tabular-nums; white-space: nowrap; min-width: 4.6em; }
+  .count.low { color: var(--low); font-weight: 700; }
+
+  .blister { display: grid; grid-template-columns: repeat(5, 18px); gap: 5px 6px; padding: 7px 8px;
+             background: var(--foil); border: 1px solid var(--foil-edge); border-radius: 6px; }
+  .pocket { width: 18px; height: 18px; border-radius: 50%; background: var(--pocket-empty);
+            box-shadow: inset 0 1px 2px rgba(28, 43, 39, .25); position: relative; }
+  .pocket.full { background: #fff; box-shadow: 0 1px 1.5px rgba(28, 43, 39, .35), inset 0 -2px 0 #e6ebec; }
+  .pocket.full::after { content: ""; position: absolute; left: 4px; right: 4px; top: 8px; height: 1.5px;
+                        background: #d3dadc; border-radius: 1px; }   /* score line on the tablet */
+  .pocket.pop { animation: pop .45s ease-in forwards; }
+  @keyframes pop {
+    30% { transform: translateY(-4px) scale(1.15); }
+    100% { transform: translateY(-22px) scale(.6); opacity: 0; }
+  }
+
+  .reserve { font: inherit; font-size: .92rem; font-weight: 700; color: var(--cross-dark); background: var(--cross-soft);
+             border: 0; border-radius: 999px; padding: 9px 16px; cursor: pointer; white-space: nowrap; }
+  .reserve:hover { background: #c9e7d7; }
+  .reserve:disabled { opacity: .55; cursor: progress; }
+
+  .hint { margin: 18px 0 0; color: var(--muted); max-width: 60ch; }
+  .hint.error { color: var(--low); }
+
+  /* ---------- coordinator nodes ---------- */
+  .system { margin: 64px 0 48px; padding-top: 22px; border-top: 1px solid var(--rule); }
+  .system h2 { margin: 0; font-size: 1.15rem; font-weight: 700; font-variation-settings: "wdth" 80; }
+  .system > p { margin: 4px 0 0; color: var(--muted); font-size: .92rem; max-width: 64ch; }
+  .nodes { display: grid; grid-template-columns: repeat(3, 1fr); margin-top: 18px; }
+  .node { padding: 4px 18px; }
+  .node + .node { border-left: 1px solid var(--rule); }
+  .node:first-child { padding-left: 0; }
+  .node .num { font-size: 2.6rem; line-height: 1; font-weight: 800; font-variation-settings: "wdth" 62;
+               font-variant-numeric: tabular-nums; }
+  .node .role { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-weight: 700; }
+  .node .detail { color: var(--muted); font-size: .88rem; margin-top: 2px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--rule); flex: none; }
+  .node.leader .num, .node.leader .role { color: var(--cross-dark); }
+  .node.leader .dot { background: var(--cross); animation: beacon 2s ease-out infinite; }
+  .node.follower .dot { background: var(--ink); }
+  .node.down { color: #97a5a0; }
+  .node.down .num { text-decoration: line-through; text-decoration-thickness: 3px; }
+  @keyframes beacon {
+    0% { box-shadow: 0 0 0 0 rgba(14, 138, 85, .55); }
+    70%, 100% { box-shadow: 0 0 0 10px rgba(14, 138, 85, 0); }
+  }
+
+  @media (max-width: 640px) {
+    .ask { margin-top: 32px; }
+    .ask .line { display: grid; grid-template-columns: 1fr; gap: .1em; }
+    .find { margin: 18px 0 0; width: 100%; padding: 14px; }
+    .results { padding: 2px 16px; }
+    .row { grid-template-columns: 1fr auto; }
+    .who { grid-column: 1 / -1; }
+    .nodes { grid-template-columns: 1fr; }
+    .node, .node:first-child { padding: 12px 0; display: grid; grid-template-columns: 3.2rem 1fr; column-gap: 12px; }
+    .node .num { grid-row: span 3; }
+    .node .role { margin-top: 0; }
+    .node + .node { border-left: 0; border-top: 1px solid var(--rule); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .node.leader .dot, .pocket.pop { animation: none; }
+    .switch, .switch::after { transition: none; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="/"><span class="cross" aria-hidden="true"></span>MediFind</a>
+    <p>Live stock from pharmacies near you</p>
+  </header>
+
+  <main>
+    <form class="ask" id="form" autocomplete="off">
+      <div class="line">
+        <label for="medicine">Who has</label>
+        <input id="medicine" list="medicine-list" placeholder="medicine name" required minlength="2">
+        <datalist id="medicine-list"></datalist>
+      </div>
+      <div class="line">
+        <label for="area">near</label>
+        <select id="area"></select>
+        <button class="find" type="submit">Find it</button>
+      </div>
+    </form>
+
+    <label class="live">
+      <input type="checkbox" id="auto">
+      <span class="switch" aria-hidden="true"></span>
+      Refresh every 3 seconds to watch stock change live
+    </label>
+
+    <p class="status" id="status" aria-live="polite"></p>
+    <div class="receipt" id="receipt" role="status"></div>
+    <ol class="results" id="results"></ol>
+    <p class="hint" id="hint">Type a medicine and pick where you are. You'll see every pharmacy that has it right now, nearest first, and you can reserve a strip before you leave home.</p>
+
+    <section class="system" aria-labelledby="sys-title">
+      <h2 id="sys-title">Coordinator nodes</h2>
+      <p>Three nodes elect a leader with the Bully algorithm. The leader sends a beacon every 2 seconds
+         and hands out the locks that stop two people reserving the same last strip.</p>
+      <div class="nodes" id="nodes"></div>
+    </section>
+  </main>
+</div>
+
+<script>
+  // All requests go through Nginx: /api -> Search Service, /inventory -> Inventory Service.
+  const API = "/api";
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  const POCKETS = 10;                 // one strip shows up to 10 tablets
+  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  let timer = null;
+
+  async function loadOptions() {
+    try {
+      const [meds, areas] = await Promise.all([
+        fetch(`${API}/medicines`).then(r => r.json()),
+        fetch(`${API}/areas`).then(r => r.json()),
+      ]);
+      $("medicine-list").innerHTML = meds.map(m => `<option value="${esc(m)}">`).join("");
+      $("area").innerHTML = areas.map(a => `<option value="${a.lat},${a.lng}">${esc(a.area)}</option>`).join("");
+    } catch (e) {
+      showHint("Couldn't reach the search service. Check that it's running, then reload the page.", true);
+    }
+  }
+
+  function showHint(text, isError) {
+    $("hint").textContent = text;
+    $("hint").className = "hint" + (isError ? " error" : "");
+    $("hint").hidden = !text;
+  }
+
+  function timeAgo(iso) {
+    const secs = Math.max(0, (Date.now() - new Date(iso + "Z").getTime()) / 1000);
+    if (secs < 60) return "just now";
+    if (secs < 3600) return `${Math.round(secs / 60)} min ago`;
+    return `${Math.round(secs / 3600)} h ago`;
+  }
+
+  function blister(qty) {
+    const full = Math.min(qty, POCKETS);
+    let html = "";
+    for (let i = 0; i < POCKETS; i++) html += `<span class="pocket${i < full ? " full" : ""}"></span>`;
+    return `<span class="blister" aria-hidden="true">${html}</span>`;
+  }
+
+  function countText(qty) {
+    return qty < 5 ? `<span class="count low">Only ${qty} left</span>` : `<span class="count">${qty} in stock</span>`;
+  }
+
+  async function search() {
+    const medicine = $("medicine").value.trim();
+    if (medicine.length < 2) return;
+    const [lat, lng] = $("area").value.split(",");
+    const areaName = $("area").selectedOptions[0]?.textContent || "you";
+    const started = performance.now();
+    try {
+      const res = await fetch(`${API}/search?` + new URLSearchParams({ medicine, lat, lng, limit: 10 }));
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || res.statusText);
+      const ms = Math.round(performance.now() - started);
+      const how = data.source === "cache" ? "Answered from the cache"
+                : data.source === "db" ? "Looked up in the database"
+                : "Looked up in the database (cache unavailable)";
+      $("status").innerHTML = data.count
+        ? `<b>${data.count} ${data.count === 1 ? "pharmacy has" : "pharmacies have"} ${esc(medicine)}</b> near ${esc(areaName)}.
+           <span class="how">${how} by ${esc(data.served_by)} in ${ms} ms.</span>`
+        : `<span class="how">${how} by ${esc(data.served_by)} in ${ms} ms.</span>`;
+
+      if (!data.results.length) {
+        $("results").innerHTML = "";
+        showHint(`No pharmacy near ${areaName} has ${medicine} right now. Turn on live refresh to see the moment someone restocks it.`);
+        return;
+      }
+      showHint("");
+      $("results").innerHTML = data.results.map(r => `
+        <li class="row">
+          <div class="who">
+            <h3>${esc(r.pharmacy)}</h3>
+            <p>${esc(r.area)}, ${r.distance_km < 0.1 ? "in your area" : `${r.distance_km} km away`}.
+               Updated ${timeAgo(r.updated_at)}.</p>
+          </div>
+          <div class="stock">${blister(r.quantity)}${countText(r.quantity)}</div>
+          <button class="reserve" data-id="${r.pharmacy_id}" data-med="${esc(r.medicine)}"
+                  data-name="${esc(r.pharmacy)}">Reserve 1</button>
+        </li>`).join("");
+    } catch (e) {
+      $("status").innerHTML = "";
+      $("results").innerHTML = "";
+      showHint(`Search didn't work: ${e.message}. Try again in a few seconds.`, true);
+    }
+  }
+
+  function receipt(html, ok) {
+    $("receipt").className = "receipt show" + (ok ? "" : " bad");
+    $("receipt").innerHTML = html;
+  }
+
+  // Reserve 1 strip. The Inventory Service takes a distributed lock from the
+  // coordinator leader before it changes the stock (mutual exclusion).
+  $("results").addEventListener("click", async (e) => {
+    const btn = e.target.closest("button.reserve");
+    if (!btn) return;
+    btn.disabled = true;
+    btn.textContent = "Reserving";
+    try {
+      const res = await fetch("/inventory/reserve", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pharmacy_id: +btn.dataset.id, medicine: btn.dataset.med, quantity: 1 }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || res.statusText);
+      const pockets = btn.closest(".row").querySelectorAll(".pocket.full");
+      if (pockets.length) pockets[pockets.length - 1].classList.add("pop");
+      btn.textContent = "Reserved";
+      receipt(`<strong>Reserved 1 strip of ${esc(data.medicine)} at ${esc(btn.dataset.name)}</strong>
+               <span>Show reservation R-${data.reservation_id} at the counter. ${data.remaining} left.
+               Lock granted by coordinator node ${data.lock.granted_by_node}.</span>`, true);
+      setTimeout(search, 650);
+    } catch (err) {
+      receipt(`<strong>Couldn't reserve ${esc(btn.dataset.med)}</strong><span>${esc(err.message)}</span>`, false);
+      btn.disabled = false;
+      btn.textContent = "Reserve 1";
+    }
+  });
+
+  async function loadNodes() {
+    try {
+      const { nodes } = await fetch("/inventory/cluster").then(r => r.json());
+      $("nodes").innerHTML = nodes.map(n => {
+        if (!n.up) return `<div class="node down"><div class="num">${n.node_id}</div>
+            <div class="role"><span class="dot"></span>Not responding</div>
+            <div class="detail">Left out of elections until it returns</div></div>`;
+        const leader = n.role === "leader";
+        const locks = leader && n.locks ? n.locks.stats : null;
+        return `<div class="node ${leader ? "leader" : "follower"}"><div class="num">${n.node_id}</div>
+            <div class="role"><span class="dot"></span>${leader ? "Leader" : "Follower"}</div>
+            <div class="detail">${leader ? "Sending a beacon every 2 s" : `Last beacon ${n.seconds_since_beacon} s ago`}</div>
+            <div class="detail">${locks ? `${plural(locks.granted, "lock")} granted, ${locks.had_to_wait} had to wait`
+                                        : `${plural(n.stats.elections_started, "election")} run`}</div></div>`;
+      }).join("");
+    } catch (e) {
+      $("nodes").innerHTML = `<p class="hint error">Node status is unavailable. Check that the Inventory Service is running.</p>`;
+    }
+  }
+
+  $("form").addEventListener("submit", (e) => { e.preventDefault(); search(); });
+  $("auto").addEventListener("change", (e) => {
+    clearInterval(timer);
+    if (e.target.checked) timer = setInterval(search, 3000);
+  });
+  loadOptions();
+  loadNodes();
+  setInterval(loadNodes, 2000);
+</script>
+</body>
+</html>

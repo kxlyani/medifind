@@ -1,0 +1,54 @@
+# Coordinator cluster: 3 nodes that elect a leader (Bully algorithm), detect
+# failures with beacons, and provide distributed locks (mutual exclusion).
+# All node-to-node messages are RPC calls (XML-RPC).
+#
+# Why a StatefulSet (not a Deployment)?
+#   The Bully algorithm needs every node to have a FIXED, KNOWN ID and address.
+#   A StatefulSet gives pods stable names: coordinator-0, coordinator-1, coordinator-2
+#   (node IDs 1, 2, 3) and stable DNS names via the headless Service below:
+#   coordinator-0.coordinator, coordinator-1.coordinator, ...
+#
+# Demo: kill the leader and watch a new one get elected
+#   kubectl -n medifind delete pod coordinator-2
+#   kubectl -n medifind logs -f coordinator-1
+apiVersion: v1
+kind: Service
+metadata:
+  name: coordinator
+  namespace: medifind
+spec:
+  clusterIP: None                  # "headless": DNS returns each pod's own address
+  publishNotReadyAddresses: true   # nodes must find each other while starting up
+  selector: { app: coordinator }
+  ports: [{ name: rpc, port: 9000, targetPort: 9000 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: coordinator
+  namespace: medifind
+spec:
+  serviceName: coordinator
+  replicas: 3
+  podManagementPolicy: Parallel    # start all 3 at once (default is one after another)
+  selector:
+    matchLabels: { app: coordinator }
+  template:
+    metadata:
+      labels: { app: coordinator }
+    spec:
+      containers:
+        - name: coordinator
+          image: medifind/coordinator:1.0
+          imagePullPolicy: IfNotPresent
+          ports: [{ containerPort: 9000, name: rpc }]
+          env:
+            # NODE_ID is worked out from the pod name (coordinator-N -> N+1)
+            - name: PEERS
+              valueFrom: { configMapKeyRef: { name: medifind-config, key: COORDINATOR_PEERS } }
+          readinessProbe:
+            tcpSocket: { port: 9000 }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 25m, memory: 32Mi }
+            limits:   { cpu: 200m, memory: 64Mi }

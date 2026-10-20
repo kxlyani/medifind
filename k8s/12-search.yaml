@@ -1,0 +1,45 @@
+# Search Service: the part that SCALES.
+# Starts with 2 replicas; the HPA (20-hpa.yaml) can grow it to 5.
+# The Service below load-balances requests across all ready replicas.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: search-service
+  namespace: medifind
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: search-service }
+  template:
+    metadata:
+      labels: { app: search-service }
+    spec:
+      containers:
+        - name: search-service
+          image: medifind/search-service:1.0
+          imagePullPolicy: IfNotPresent
+          ports: [{ containerPort: 8002 }]
+          envFrom:
+            - configMapRef: { name: medifind-config }
+          readinessProbe:
+            httpGet: { path: /health, port: 8002 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: 8002 }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          # CPU "requests" are REQUIRED for the HPA: it scales on
+          # "% of requested CPU". 50% of 100m = 50m average per pod.
+          resources:
+            requests: { cpu: 100m, memory: 96Mi }
+            limits:   { cpu: 500m, memory: 192Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: search-service
+  namespace: medifind
+spec:
+  selector: { app: search-service }
+  ports: [{ port: 8002, targetPort: 8002 }]

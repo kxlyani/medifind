@@ -1,0 +1,41 @@
+# Namespace: a separate "folder" in the cluster for everything in this project.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: medifind
+---
+# ConfigMap: normal (non-secret) settings, shared by all services.
+# Note how hosts are SERVICE NAMES, not IPs -> Kubernetes DNS = service discovery.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: medifind-config
+  namespace: medifind
+data:
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  DB_NAME: medifind
+  DB_USER: medifind
+  RABBITMQ_HOST: rabbitmq
+  RABBITMQ_PORT: "5672"
+  RABBITMQ_USER: medifind
+  QUEUE_NAME: stock_updates
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  INVENTORY_URL: http://inventory-service:8001
+  CACHE_TTL: "30"
+  # Coordinator cluster: node ID = pod ordinal + 1 (stable StatefulSet DNS names)
+  COORDINATOR_PEERS: "1=coordinator-0.coordinator:9000,2=coordinator-1.coordinator:9000,3=coordinator-2.coordinator:9000"
+  CRITICAL_SECTION_DELAY_MS: "50"
+---
+# Secret: passwords. Kept separate from the ConfigMap so they can be
+# protected differently. (Demo values; change them for anything real.)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: medifind-secret
+  namespace: medifind
+type: Opaque
+stringData:
+  DB_PASSWORD: medifind
+  RABBITMQ_PASSWORD: medifind

@@ -1,0 +1,36 @@
+# Frontend (Nginx): the only thing exposed outside the cluster.
+# NodePort makes it reachable on the Minikube node at port 30080.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: medifind
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: frontend }
+  template:
+    metadata:
+      labels: { app: frontend }
+    spec:
+      containers:
+        - name: frontend
+          image: medifind/frontend:1.0
+          imagePullPolicy: IfNotPresent
+          ports: [{ containerPort: 80 }]
+          readinessProbe:
+            httpGet: { path: /, port: 80 }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+            limits:   { cpu: 500m, memory: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: medifind
+spec:
+  type: NodePort
+  selector: { app: frontend }
+  ports: [{ port: 80, targetPort: 80, nodePort: 30080 }]

@@ -1,0 +1,27 @@
+# Horizontal Pod Autoscaler: automatic scaling of the Search Service.
+# Every ~15 s Kubernetes checks the average CPU of the search pods.
+# If it is above 50% of the requested CPU, it adds pods (up to 5);
+# when load drops it removes them again (down to 2).
+# Requires the metrics-server addon:  minikube addons enable metrics-server
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: search-service
+  namespace: medifind
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: search-service
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 60   # default is 300 s; shorter so the demo shows scale-down too
