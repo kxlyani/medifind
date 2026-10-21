@@ -22,11 +22,13 @@ import json
 import os
 import socket
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pika
 import psycopg2
 import redis
+
+import activity
 
 DB = dict(
     host=os.getenv("DB_HOST", "postgres"),
@@ -78,6 +80,7 @@ class Consumer:
         self.cache = redis.Redis(host=REDIS_HOST, port=REDIS_PORT,
                                  socket_timeout=1, socket_connect_timeout=1)
         self.processed = 0
+        self.pharmacy_names: dict[int, str] = {}   # small cache for the activity log
 
     def canonical_name(self, cur, medicine: str) -> str:
         """Reuse the existing spelling so 'dolo 650' and 'Dolo 650' stay one row."""
@@ -86,14 +89,24 @@ class Consumer:
         row = cur.fetchone()
         return row[0] if row else medicine
 
-    def save(self, event: dict) -> str:
+    def save(self, event: dict) -> tuple[str, bool]:
+        """Returns (medicine name as stored, whether the update was applied)."""
         ts = datetime.fromisoformat(event["timestamp"]).replace(tzinfo=None)
         with self.db.cursor() as cur:
             name = self.canonical_name(cur, event["medicine"])
             cur.execute(UPSERT_SQL, (event["pharmacy_id"], name, event["quantity"], ts))
             applied = cur.rowcount == 1
         self.db.commit()
-        return name if applied else ""
+        return name, applied
+
+    def pharmacy_name(self, pharmacy_id: int) -> str:
+        if pharmacy_id not in self.pharmacy_names:
+            with self.db.cursor() as cur:
+                cur.execute("SELECT name FROM pharmacies WHERE id = %s", (pharmacy_id,))
+                row = cur.fetchone()
+            self.db.commit()
+            self.pharmacy_names[pharmacy_id] = row[0] if row else f"Pharmacy {pharmacy_id}"
+        return self.pharmacy_names[pharmacy_id]
 
     def invalidate_cache(self, medicine: str):
         try:
@@ -113,6 +126,8 @@ class Consumer:
         except (ValueError, json.JSONDecodeError) as e:
             print(f"[consumer] dropping bad message: {e}", flush=True)
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+            activity.record(self.cache, "rejected", "Rejected a broken message",
+                            f"{e}. Dropped by {POD_NAME} so it can't block the queue.")
             return
 
         if PROCESS_DELAY_MS:
@@ -120,11 +135,13 @@ class Consumer:
 
         # 2. Save to the database.
         try:
-            name = self.save(event)
+            name, applied = self.save(event)
         except psycopg2.errors.ForeignKeyViolation:
             self.db.rollback()
             print(f"[consumer] unknown pharmacy {event['pharmacy_id']}, dropping event", flush=True)
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+            activity.record(self.cache, "rejected", f"Rejected an update for unknown pharmacy {event['pharmacy_id']}",
+                            f"Dropped by {POD_NAME}.")
             return
         except psycopg2.Error as e:
             # Database problem: put the message BACK in the queue and reconnect.
@@ -138,13 +155,25 @@ class Consumer:
             return
 
         # 3. Clear the cache, then ACK. ACK last = at-least-once delivery.
-        if name:
+        if applied:
             self.invalidate_cache(name)
         ch.basic_ack(delivery_tag=method.delivery_tag)
         self.processed += 1
-        status = "applied" if name else "skipped (older than stored data)"
+        status = "applied" if applied else "skipped (older than stored data)"
         print(f"[consumer {POD_NAME}] #{self.processed} pharmacy={event['pharmacy_id']} "
               f"{event['medicine']} -> {event['quantity']} {status}", flush=True)
+
+        # 4. Record it for the live activity feed (how long since the pharmacy sent it).
+        sent = datetime.fromisoformat(event["timestamp"])
+        delay_ms = max(0, round((datetime.now(timezone.utc) - sent).total_seconds() * 1000))
+        pharmacy = self.pharmacy_name(event["pharmacy_id"])
+        if applied:
+            activity.record(self.cache, "update", f"{pharmacy} set {name} to {event['quantity']}",
+                            f"Saved by {POD_NAME}, {delay_ms} ms after the pharmacy sent it",
+                            pod=POD_NAME, delay_ms=delay_ms)
+        else:
+            activity.record(self.cache, "skipped", f"Ignored an out-of-date update for {name} at {pharmacy}",
+                            f"A newer update was already saved. Checked by {POD_NAME}.", pod=POD_NAME)
 
     def run(self):
         while True:

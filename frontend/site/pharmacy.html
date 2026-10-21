@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MediFind pharmacy portal</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="/"><span class="cross" aria-hidden="true"></span>MediFind</a>
+    <nav aria-label="Pages">
+      <a href="/">Find medicine</a>
+      <a href="pharmacy.html" aria-current="page">Pharmacy portal</a>
+      <a href="system.html">System view</a>
+    </nav>
+  </header>
+
+  <main>
+    <div class="page-head">
+      <h1>Pharmacy portal</h1>
+      <p>For pharmacy staff to keep their stock up to date. Each change is sent as a message to the
+         queue and saved by a consumer a moment later, so customers searching see it within seconds.</p>
+    </div>
+
+    <div class="picker">
+      <label for="pharmacy">Managing</label>
+      <select id="pharmacy"></select>
+    </div>
+
+    <section class="panel" aria-labelledby="s-title">
+      <h2 id="s-title">Your stock</h2>
+      <p>Change a quantity and press Save. Set it to 0 when a medicine runs out.</p>
+      <ul class="shelf" id="shelf"></ul>
+      <form class="add-row" id="add">
+        <input type="text" id="new-med" placeholder="Add a medicine you now stock" minlength="2" maxlength="100" required
+               aria-label="New medicine name">
+        <input type="number" id="new-qty" min="0" max="100000" value="10" required aria-label="Quantity">
+        <button class="btn" type="submit">Add to stock</button>
+      </form>
+      <p class="hint" id="add-status" hidden></p>
+    </section>
+
+    <section class="panel" aria-labelledby="b-title" style="margin-bottom: 56px">
+      <h2 id="b-title">Recent reservations</h2>
+      <p>Customers who reserved here. They'll show the reservation number at your counter.</p>
+      <ul class="bookings" id="bookings"></ul>
+    </section>
+  </main>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const getJSON = async (url) => {
+    const res = await fetch(url);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || res.statusText);
+    return data;
+  };
+  const pharmacyId = () => +$("pharmacy").value;
+
+  function timeAgo(iso) {
+    const secs = Math.max(0, Math.round((Date.now() - new Date(iso + (iso.endsWith("Z") || iso.includes("+") ? "" : "Z")).getTime()) / 1000));
+    if (secs < 5) return "just now";
+    if (secs < 60) return `${secs} s ago`;
+    if (secs < 3600) return `${Math.floor(secs / 60)} min ago`;
+    if (secs < 86400) return `${Math.floor(secs / 3600)} h ago`;
+    return `${Math.floor(secs / 86400)} days ago`;
+  }
+
+  async function loadPharmacies() {
+    const list = await getJSON("/inventory/pharmacies");
+    $("pharmacy").innerHTML = list.map(p => `<option value="${p.id}">${esc(p.name)}, ${esc(p.area)}</option>`).join("");
+    const fromUrl = new URLSearchParams(location.search).get("id");
+    if (fromUrl && list.some(p => p.id === +fromUrl)) $("pharmacy").value = fromUrl;
+  }
+
+  // ---------------------------------------------------------- stock list
+  async function loadStock() {
+    try {
+      const { stock } = await getJSON(`/inventory/pharmacies/${pharmacyId()}/stock`);
+      $("shelf").innerHTML = stock.map(s => `
+        <li data-med="${esc(s.medicine)}" data-updated="${esc(s.updated_at)}">
+          <div class="med">${esc(s.medicine)}<small>${s.quantity === 0 ? "Sold out. " : ""}Updated ${timeAgo(s.updated_at)}</small></div>
+          <div class="qty"><input type="number" min="0" max="100000" value="${s.quantity}"
+               aria-label="Quantity of ${esc(s.medicine)}"></div>
+          <button class="reserve save" type="button">Save</button>
+        </li>`).join("");
+    } catch (e) {
+      $("shelf").innerHTML = `<li><span class="error">Couldn't load stock: ${esc(e.message)}</span></li>`;
+    }
+  }
+
+  async function send(medicine, quantity) {
+    const res = await fetch("/pharmacy/stock", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pharmacy_id: pharmacyId(), medicine, quantity }) });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || res.statusText);
+    return data;
+  }
+
+  // Wait until a consumer has saved our update, so staff can see the
+  // asynchronous path: accepted -> waiting in queue -> saved.
+  async function waitUntilSaved(pid, medicine, quantity, previousUpdate, onWait) {
+    const started = performance.now();
+    while (performance.now() - started < 5 * 60 * 1000) {
+      const { stock } = await getJSON(`/inventory/pharmacies/${pid}/stock`);
+      const row = stock.find(s => s.medicine.toLowerCase() === medicine.toLowerCase());
+      if (row && row.quantity === quantity && row.updated_at !== previousUpdate) {
+        return { took: (performance.now() - started) / 1000, updated: row.updated_at };
+      }
+      onWait((performance.now() - started) / 1000);
+      await sleep(400);
+    }
+    throw new Error("still not saved after 5 minutes");
+  }
+
+  $("shelf").addEventListener("click", async (e) => {
+    const btn = e.target.closest("button.save");
+    if (!btn) return;
+    const li = btn.closest("li");
+    const note = li.querySelector("small");
+    const quantity = parseInt(li.querySelector("input").value, 10);
+    if (!(quantity >= 0)) { note.textContent = "Enter a quantity of 0 or more."; return; }
+    const pid = pharmacyId();
+    btn.disabled = true;
+    try {
+      await send(li.dataset.med, quantity);
+      note.className = "waiting";
+      note.textContent = "Sent. Waiting in the queue for a consumer…";
+      const { took, updated } = await waitUntilSaved(pid, li.dataset.med, quantity, li.dataset.updated, (s) => {
+        if (s > 3) note.textContent = `Waiting in the queue for ${Math.round(s)} s. Are the consumers running?`;
+      });
+      note.className = "saved";
+      note.textContent = `Saved by a consumer ${took < 0.1 ? "within 0.1 s" : `${took.toFixed(1)} s after you sent it`}. ` +
+                         `Customers see ${quantity} now.`;
+      li.dataset.updated = updated;
+      li.classList.remove("changed"); void li.offsetWidth; li.classList.add("changed");
+    } catch (err) {
+      note.className = "";
+      note.textContent = `Not saved: ${err.message}`;
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  $("add").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const medicine = $("new-med").value.trim();
+    const quantity = parseInt($("new-qty").value, 10);
+    const status = $("add-status");
+    status.hidden = false;
+    status.className = "hint";
+    try {
+      await send(medicine, quantity);
+      status.textContent = `Sent ${medicine}. Waiting for a consumer to save it…`;
+      const { took } = await waitUntilSaved(pharmacyId(), medicine, quantity, null, () => {});
+      status.textContent = `${medicine} added. A consumer saved it ${took < 0.1 ? "within 0.1 s" : `${took.toFixed(1)} s after you sent it`}.`;
+      $("new-med").value = "";
+      await loadStock();
+    } catch (err) {
+      status.className = "hint error";
+      status.textContent = `Couldn't add ${medicine}: ${err.message}`;
+    }
+  });
+
+  // ---------------------------------------------------------- reservations
+  async function loadBookings() {
+    try {
+      const { reservations } = await getJSON(`/inventory/pharmacies/${pharmacyId()}/reservations`);
+      $("bookings").innerHTML = reservations.length
+        ? reservations.map(r => `<li><strong>R-${r.id}</strong>: ${r.quantity} ${r.quantity === 1 ? "strip" : "strips"} of
+            ${esc(r.medicine)} <span>for ${esc(r.customer)}, ${timeAgo(r.created_at)}</span></li>`).join("")
+        : `<li class="hint">No reservations yet. They appear here when customers press Reserve on the Find medicine page.</li>`;
+    } catch (e) {
+      $("bookings").innerHTML = `<li class="error">Couldn't load reservations: ${esc(e.message)}</li>`;
+    }
+  }
+
+  $("pharmacy").addEventListener("change", () => {
+    history.replaceState(null, "", `?id=${pharmacyId()}`);
+    $("add-status").hidden = true;
+    loadStock(); loadBookings();
+  });
+
+  (async () => {
+    try {
+      await loadPharmacies();
+      await Promise.all([loadStock(), loadBookings()]);
+    } catch (e) {
+      $("shelf").innerHTML = `<li><span class="error">Couldn't reach the services: ${esc(e.message)}</span></li>`;
+    }
+    setInterval(() => { if (!document.hidden) loadBookings(); }, 5000);
+  })();
+</script>
+</body>
+</html>

@@ -7,6 +7,9 @@ Endpoints
   GET  /health, /pharmacies, /medicines, /stock?medicine=X   (read stock)
   POST /reserve     reserve a medicine at a pharmacy  (uses MUTUAL EXCLUSION)
   GET  /cluster     status of the coordinator cluster (leader, beacons, locks)
+  GET  /activity    live feed of what the system just did (stock updates, reservations)
+  GET  /pharmacies/{id}/stock          every medicine at one pharmacy (pharmacy portal)
+  GET  /pharmacies/{id}/reservations   recent reservations at one pharmacy
 
 The background consumer that saves stock-update events lives in consumer.py.
 
@@ -37,6 +40,7 @@ from fastapi import FastAPI, HTTPException, Query
 from psycopg2.pool import ThreadedConnectionPool
 from pydantic import BaseModel, Field
 
+import activity
 from coordination import CoordinatorClient, LockUnavailable
 
 DB_HOST = os.getenv("DB_HOST", "postgres")
@@ -126,6 +130,27 @@ def list_pharmacies():
     return query("SELECT id, name, area, lat, lng FROM pharmacies ORDER BY id")
 
 
+@app.get("/pharmacies/{pharmacy_id}/stock")
+def pharmacy_stock(pharmacy_id: int):
+    """Every medicine one pharmacy carries, including sold-out ones (pharmacy portal)."""
+    rows = query(
+        "SELECT medicine_name AS medicine, quantity, updated_at FROM stock "
+        "WHERE pharmacy_id = %s ORDER BY medicine_name", (pharmacy_id,))
+    for r in rows:
+        r["updated_at"] = r["updated_at"].isoformat()
+    return {"pharmacy_id": pharmacy_id, "served_by": POD_NAME, "stock": rows}
+
+
+@app.get("/pharmacies/{pharmacy_id}/reservations")
+def pharmacy_reservations(pharmacy_id: int, limit: int = Query(10, ge=1, le=50)):
+    rows = query(
+        "SELECT id, medicine_name AS medicine, quantity, customer, reserved_by, created_at "
+        "FROM reservations WHERE pharmacy_id = %s ORDER BY id DESC LIMIT %s", (pharmacy_id, limit))
+    for r in rows:
+        r["created_at"] = r["created_at"].isoformat()
+    return {"pharmacy_id": pharmacy_id, "reservations": rows}
+
+
 @app.get("/medicines")
 def list_medicines():
     rows = query("SELECT DISTINCT medicine_name FROM stock ORDER BY medicine_name")
@@ -191,8 +216,10 @@ def reserve_critical_section(req: ReservationRequest) -> dict:
                 "VALUES (%s, %s, %s, %s, %s) RETURNING id",
                 (req.pharmacy_id, row["medicine_name"], req.quantity, req.customer, POD_NAME))
             reservation_id = cur.fetchone()["id"]
+            cur.execute("SELECT name FROM pharmacies WHERE id = %s", (req.pharmacy_id,))
+            pharmacy = cur.fetchone()["name"]
     invalidate_cache(row["medicine_name"])
-    return {"reservation_id": reservation_id, "medicine": row["medicine_name"],
+    return {"reservation_id": reservation_id, "medicine": row["medicine_name"], "pharmacy": pharmacy,
             "pharmacy_id": req.pharmacy_id, "quantity": req.quantity, "remaining": remaining}
 
 
@@ -203,6 +230,9 @@ def reserve(req: ReservationRequest, use_lock: bool = True):
         # DEMO ONLY: no mutual exclusion -> race conditions are possible
         result = reserve_critical_section(req)
         result.update(lock={"used": False}, served_by=POD_NAME)
+        activity.record(cache, "reserved-unsafe",
+                        f"Reserved {req.quantity} {result['medicine']} at {result['pharmacy']} WITHOUT a lock",
+                        f"Handled by {POD_NAME}. {result['remaining']} left.", pod=POD_NAME)
         return result
     try:
         with coordinator.lock(resource) as held:
@@ -211,7 +241,16 @@ def reserve(req: ReservationRequest, use_lock: bool = True):
         raise HTTPException(503, f"Could not get lock: {e}")
     result.update(lock={"used": True, "resource": resource, "granted_by_node": held["leader_id"]},
                   served_by=POD_NAME)
+    activity.record(cache, "reserved", f"Reserved {req.quantity} {result['medicine']} at {result['pharmacy']}",
+                    f"Handled by {POD_NAME} with a lock from coordinator node {held['leader_id']}. "
+                    f"{result['remaining']} left.", pod=POD_NAME)
     return result
+
+
+@app.get("/activity")
+def recent_activity(limit: int = Query(40, ge=1, le=60)):
+    """Newest first. Written by every consumer and Inventory pod into one shared Redis list."""
+    return {"events": activity.recent(cache, limit)}
 
 
 @app.get("/cluster")

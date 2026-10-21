@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MediFind</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="/"><span class="cross" aria-hidden="true"></span>MediFind</a>
+    <nav aria-label="Pages">
+      <a href="/" aria-current="page">Find medicine</a>
+      <a href="pharmacy.html">Pharmacy portal</a>
+      <a href="system.html">System view</a>
+    </nav>
+  </header>
+
+  <main>
+    <form class="ask" id="form" autocomplete="off">
+      <div class="line">
+        <label for="medicine">Who has</label>
+        <input id="medicine" list="medicine-list" placeholder="medicine name" required minlength="2">
+        <datalist id="medicine-list"></datalist>
+      </div>
+      <div class="line">
+        <label for="area">near</label>
+        <select id="area"></select>
+        <button class="find" type="submit">Find it</button>
+      </div>
+    </form>
+
+    <label class="live">
+      <input type="checkbox" id="auto">
+      <span class="switch" aria-hidden="true"></span>
+      Refresh every 3 seconds to watch stock change live
+    </label>
+
+    <p class="status" id="status" aria-live="polite"></p>
+    <div class="receipt" id="receipt" role="status"></div>
+    <ol class="results" id="results"></ol>
+    <p class="hint" id="hint">Type a medicine and pick where you are. You'll see every pharmacy that has it right now, nearest first, and you can reserve a strip before you leave home.</p>
+
+  </main>
+</div>
+
+<script>
+  // All requests go through Nginx: /api -> Search Service, /inventory -> Inventory Service.
+  const API = "/api";
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  const POCKETS = 10;                 // one strip shows up to 10 tablets
+  let timer = null;
+
+  async function loadOptions() {
+    try {
+      const [meds, areas] = await Promise.all([
+        fetch(`${API}/medicines`).then(r => r.json()),
+        fetch(`${API}/areas`).then(r => r.json()),
+      ]);
+      $("medicine-list").innerHTML = meds.map(m => `<option value="${esc(m)}">`).join("");
+      $("area").innerHTML = areas.map(a => `<option value="${a.lat},${a.lng}">${esc(a.area)}</option>`).join("");
+    } catch (e) {
+      showHint("Couldn't reach the search service. Check that it's running, then reload the page.", true);
+    }
+  }
+
+  function showHint(text, isError) {
+    $("hint").textContent = text;
+    $("hint").className = "hint" + (isError ? " error" : "");
+    $("hint").hidden = !text;
+  }
+
+  function timeAgo(iso) {
+    const secs = Math.max(0, Math.round((Date.now() - new Date(iso + "Z").getTime()) / 1000));
+    if (secs < 5) return "just now";
+    if (secs < 60) return `${secs} s ago`;
+    if (secs < 3600) return `${Math.floor(secs / 60)} min ${secs % 60} s ago`;
+    return `${Math.floor(secs / 3600)} h ago`;
+  }
+
+  // Remember each pharmacy's last stock update, so rows that changed since the
+  // previous refresh can be highlighted.
+  let lastSeen = {};
+  let lastMedicine = "";
+
+  function blister(qty) {
+    const full = Math.min(qty, POCKETS);
+    let html = "";
+    for (let i = 0; i < POCKETS; i++) html += `<span class="pocket${i < full ? " full" : ""}"></span>`;
+    return `<span class="blister" aria-hidden="true">${html}</span>`;
+  }
+
+  function countText(qty) {
+    return qty < 5 ? `<span class="count low">Only ${qty} left</span>` : `<span class="count">${qty} in stock</span>`;
+  }
+
+  async function search() {
+    const medicine = $("medicine").value.trim();
+    if (medicine.length < 2) return;
+    const [lat, lng] = $("area").value.split(",");
+    const areaName = $("area").selectedOptions[0]?.textContent || "you";
+    const started = performance.now();
+    try {
+      const res = await fetch(`${API}/search?` + new URLSearchParams({ medicine, lat, lng, limit: 10 }));
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || res.statusText);
+      const ms = Math.round(performance.now() - started);
+      const how = data.source === "cache" ? "Answered from the cache"
+                : data.source === "db" ? "Looked up in the database"
+                : "Looked up in the database (cache unavailable)";
+      $("status").innerHTML = data.count
+        ? `<b>${data.count} ${data.count === 1 ? "pharmacy has" : "pharmacies have"} ${esc(medicine)}</b> near ${esc(areaName)}.
+           <span class="how">${how} by ${esc(data.served_by)} in ${ms} ms.</span>`
+        : `<span class="how">${how} by ${esc(data.served_by)} in ${ms} ms.</span>`;
+
+      if (!data.results.length) {
+        $("results").innerHTML = "";
+        showHint(`No pharmacy near ${areaName} has ${medicine} right now. Turn on live refresh to see the moment someone restocks it.`);
+        return;
+      }
+      showHint("");
+      const sameSearch = lastMedicine === medicine.toLowerCase();
+      const changed = (r) => sameSearch && lastSeen[r.pharmacy_id] !== undefined
+                             && lastSeen[r.pharmacy_id] !== `${r.quantity}|${r.updated_at}`;
+      const isNew = (r) => sameSearch && lastSeen[r.pharmacy_id] === undefined && Object.keys(lastSeen).length;
+      $("results").innerHTML = data.results.map(r => `
+        <li class="row${changed(r) || isNew(r) ? " changed" : ""}">
+          <div class="who">
+            <h3>${esc(r.pharmacy)}</h3>
+            <p>${esc(r.area)}, ${r.distance_km < 0.1 ? "in your area" : `${r.distance_km} km away`}.
+               Updated ${timeAgo(r.updated_at)}.</p>
+          </div>
+          <div class="stock">${blister(r.quantity)}${countText(r.quantity)}</div>
+          <button class="reserve" data-id="${r.pharmacy_id}" data-med="${esc(r.medicine)}"
+                  data-name="${esc(r.pharmacy)}">Reserve 1</button>
+        </li>`).join("");
+      lastMedicine = medicine.toLowerCase();
+      lastSeen = Object.fromEntries(data.results.map(r => [r.pharmacy_id, `${r.quantity}|${r.updated_at}`]));
+    } catch (e) {
+      $("status").innerHTML = "";
+      $("results").innerHTML = "";
+      showHint(`Search didn't work: ${e.message}. Try again in a few seconds.`, true);
+    }
+  }
+
+  function receipt(html, ok) {
+    $("receipt").className = "receipt show" + (ok ? "" : " bad");
+    $("receipt").innerHTML = html;
+  }
+
+  // Reserve 1 strip. The Inventory Service takes a distributed lock from the
+  // coordinator leader before it changes the stock (mutual exclusion).
+  $("results").addEventListener("click", async (e) => {
+    const btn = e.target.closest("button.reserve");
+    if (!btn) return;
+    btn.disabled = true;
+    btn.textContent = "Reserving";
+    try {
+      const res = await fetch("/inventory/reserve", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pharmacy_id: +btn.dataset.id, medicine: btn.dataset.med, quantity: 1 }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || res.statusText);
+      const pockets = btn.closest(".row").querySelectorAll(".pocket.full");
+      if (pockets.length) pockets[pockets.length - 1].classList.add("pop");
+      btn.textContent = "Reserved";
+      receipt(`<strong>Reserved 1 strip of ${esc(data.medicine)} at ${esc(btn.dataset.name)}</strong>
+               <span>Show reservation R-${data.reservation_id} at the counter. ${data.remaining} left.
+               Lock granted by coordinator node ${data.lock.granted_by_node}
+               (see <a href="system.html">System view</a>).</span>`, true);
+      setTimeout(search, 650);
+    } catch (err) {
+      receipt(`<strong>Couldn't reserve ${esc(btn.dataset.med)}</strong><span>${esc(err.message)}</span>`, false);
+      btn.disabled = false;
+      btn.textContent = "Reserve 1";
+    }
+  });
+
+  $("form").addEventListener("submit", (e) => { e.preventDefault(); search(); });
+  $("auto").addEventListener("change", (e) => {
+    clearInterval(timer);
+    if (e.target.checked) timer = setInterval(search, 3000);
+  });
+  loadOptions();
+</script>
+</body>
+</html>

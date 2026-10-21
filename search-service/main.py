@@ -26,6 +26,8 @@ import json
 import math
 import os
 import socket
+import threading
+import time
 
 import httpx
 import redis
@@ -43,6 +45,40 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 client = httpx.Client(base_url=INVENTORY_URL, timeout=3.0)
 cache = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=0.5, socket_connect_timeout=0.5)
+
+
+# ---------------------------------------------------------------- pod registry
+# Every Search pod writes a heartbeat into a shared Redis hash every 2 s and
+# counts the searches it answers in 5-second buckets. GET /pods reads them back,
+# so the System view can show which pods are alive (autoscaling) and how the
+# requests are spread across them (load balancing).
+PODS_KEY = "search:pods"
+BUCKET_S = 5          # count requests in 5-second buckets
+WINDOW_S = 60         # show requests from the last minute
+POD_TIMEOUT_S = 8     # no heartbeat for 8 s = pod is gone
+
+
+def heartbeat_loop():
+    while True:
+        try:
+            cache.hset(PODS_KEY, POD_NAME, time.time())
+        except redis.RedisError:
+            pass
+        time.sleep(2)
+
+
+def count_request():
+    key = f"search:served:{POD_NAME}:{int(time.time() // BUCKET_S)}"
+    try:
+        pipe = cache.pipeline()
+        pipe.incr(key)
+        pipe.expire(key, WINDOW_S + BUCKET_S * 2)
+        pipe.execute()
+    except redis.RedisError:
+        pass
+
+
+threading.Thread(target=heartbeat_loop, daemon=True).start()
 
 
 def cache_key(medicine: str) -> str:
@@ -90,6 +126,38 @@ def health():
     return {"status": "ok", "pod": POD_NAME}
 
 
+@app.get("/pods")
+def pods():
+    """Search pods that are alive right now, with the searches each answered in the last minute."""
+    now = time.time()
+    try:
+        beats = {k.decode(): float(v) for k, v in cache.hgetall(PODS_KEY).items()}
+    except redis.RedisError:
+        raise HTTPException(status_code=503, detail="Redis unavailable, pod list unknown")
+    current = int(now // BUCKET_S)
+    buckets = range(current - WINDOW_S // BUCKET_S + 1, current + 1)
+    alive = []
+    for pod, last in sorted(beats.items()):
+        if now - last > POD_TIMEOUT_S:
+            try:
+                cache.hdel(PODS_KEY, pod)        # forget pods that stopped sending heartbeats
+            except redis.RedisError:
+                pass
+            continue
+        try:
+            counts = cache.mget([f"search:served:{pod}:{b}" for b in buckets])
+        except redis.RedisError:
+            counts = []
+        alive.append({"pod": pod, "searches_last_minute": sum(int(c) for c in counts if c),
+                      "last_heartbeat_s": round(now - last, 1)})
+    return {"pods": alive, "window_s": WINDOW_S, "asked": POD_NAME}
+
+
+@app.get("/pharmacies")
+def pharmacies():
+    return call_inventory("/pharmacies")
+
+
 @app.get("/medicines")
 def medicines():
     return call_inventory("/medicines")
@@ -113,6 +181,7 @@ def search(
     lng: float = Query(..., ge=-180, le=180),
     limit: int = Query(10, ge=1, le=50),
 ):
+    count_request()
     key = cache_key(medicine)
     cached, redis_ok = cache_get(key)
 

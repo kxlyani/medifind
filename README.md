@@ -24,7 +24,7 @@ Browser ─► Frontend (Nginx) ─► Search Service (×2–5, autoscaled) ◄�
 
 | Service | Role | Port |
 |---|---|---|
-| `frontend` | Web page + reverse proxy (`/api` → Search, `/inventory`, `/pharmacy`) | 8080 (Compose), 30080 (K8s) |
+| `frontend` | Three pages (Find medicine, Pharmacy portal, System view) + reverse proxy | 8080 (Compose), 30080 (K8s) |
 | `search-service` | Public search API, Redis cache, distance sorting; **autoscaled** | 8002 |
 | `inventory-service` | Owns the database; stock queries; reservations under a distributed lock | 8001 |
 | `coordinator` (×3) | RPC, beacon protocol, Bully leader election, mutual exclusion (lock manager) | 9000 |
@@ -63,6 +63,7 @@ kubectl -n medifind get hpa -w            # watch Search scale from 2 to 5 pods
 
 ```bash
 python demo/race_test.py --url <frontend-url>    # overbooking without the lock, exact with it
+# or press "Run the test" on the System view page
 ```
 
 ## DS concepts demonstrated
@@ -86,7 +87,7 @@ medifind/
 ├── search-service/             main.py (search + cache)
 ├── pharmacy-service/           main.py (event producer)
 ├── simulator/                  simulate.py
-├── frontend/                   index.html, nginx.conf
+├── frontend/                   nginx.conf, site/ (index.html, pharmacy.html, system.html, assets/, fonts/)
 ├── k8s/                        Kubernetes manifests + HPA
 ├── scripts/                    deploy.sh, deploy.ps1, teardown.sh
 ├── loadtest/locustfile.py      load test

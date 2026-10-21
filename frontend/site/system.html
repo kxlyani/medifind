@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MediFind system view</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="/"><span class="cross" aria-hidden="true"></span>MediFind</a>
+    <nav aria-label="Pages">
+      <a href="/">Find medicine</a>
+      <a href="pharmacy.html">Pharmacy portal</a>
+      <a href="system.html" aria-current="page">System view</a>
+    </nav>
+  </header>
+
+  <main>
+    <div class="page-head">
+      <h1>What the system is doing right now</h1>
+      <p>Every panel on this page updates live from the running services. Keep it open next to the
+         terminal during the demo: when you scale or stop something, you'll see the effect here.</p>
+    </div>
+
+    <div class="columns">
+      <div>
+        <section class="panel" aria-labelledby="q-title">
+          <h2 id="q-title">Stock updates waiting in the queue</h2>
+          <p>Pharmacies' updates wait in RabbitMQ until a consumer saves them. Scale the consumers
+             to 0 and this number grows; bring them back and it drains.</p>
+          <div class="queue" id="queue"><span class="hint">Loading…</span></div>
+          <div class="meter" id="meter"><span></span></div>
+        </section>
+
+        <section class="panel" aria-labelledby="p-title">
+          <h2 id="p-title">Search pods</h2>
+          <p>Each copy of the Search Service checks in every 2 seconds. An even spread of searches
+             is the load balancer at work; new rows appear when the autoscaler adds pods.</p>
+          <ul class="pods" id="pods"></ul>
+          <p class="hint" id="pods-summary"></p>
+        </section>
+
+        <section class="panel" aria-labelledby="n-title">
+          <h2 id="n-title">Coordinator nodes</h2>
+          <p>Three nodes elect a leader with the Bully algorithm. The leader sends a beacon every
+             2 seconds and hands out the locks that stop two people reserving the same last strip.</p>
+          <div class="nodes" id="nodes"></div>
+        </section>
+      </div>
+
+      <section class="panel" aria-labelledby="a-title">
+        <h2 id="a-title">Activity</h2>
+        <p>Every stock update the consumers save and every reservation, newest first, from all pods.</p>
+        <ol class="feed" id="feed"></ol>
+      </section>
+    </div>
+
+    <section class="panel" aria-labelledby="r-title" style="margin-bottom: 56px">
+      <h2 id="r-title">Rush hour test</h2>
+      <p>20 customers try to reserve the last 5 strips of the same medicine at the same moment:
+         first without the distributed lock, then with it.</p>
+      <div class="rush-controls">
+        <button class="btn" id="rush-run">Run the test</button>
+        <span class="setup" id="rush-setup">Uses Apollo Pharmacy's Insulin Glargine. Pause the simulator
+          first for the cleanest result.</span>
+      </div>
+      <div id="rush-results" aria-live="polite"></div>
+    </section>
+  </main>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  const getJSON = async (url) => {
+    const res = await fetch(url);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || res.statusText);
+    return data;
+  };
+
+  // ---------------------------------------------------------- queue meter
+  async function loadQueue() {
+    try {
+      const q = await getJSON("/pharmacy/queue");
+      const stalled = q.consumers === 0;
+      $("queue").innerHTML = `
+        <div class="figure ${q.waiting > 50 || stalled ? "warn" : ""}">
+          <div class="big">${q.waiting}</div><div class="label">${q.waiting === 1 ? "update" : "updates"} waiting</div></div>
+        <div class="figure ${stalled ? "warn" : ""}">
+          <div class="big">${q.consumers}</div><div class="label">${q.consumers === 1 ? "consumer" : "consumers"} listening</div></div>
+        <div class="figure">
+          <div class="big">${q.published_by_this_pod}</div><div class="label">sent by ${esc(q.pod)}</div></div>`;
+      $("meter").className = "meter" + (q.waiting > 50 || stalled ? " warn" : "");
+      $("meter").firstElementChild.style.width = Math.min(100, q.waiting) + "%";
+    } catch (e) {
+      $("queue").innerHTML = `<span class="error">Queue numbers unavailable: ${esc(e.message)}</span>`;
+    }
+  }
+
+  // ---------------------------------------------------------- search pods
+  let knownPods = null;
+  async function loadPods() {
+    try {
+      const { pods } = await getJSON("/api/pods");
+      const max = Math.max(1, ...pods.map(p => p.searches_last_minute));
+      const total = pods.reduce((t, p) => t + p.searches_last_minute, 0);
+      $("pods").innerHTML = pods.map(p => `
+        <li class="${knownPods && !knownPods.has(p.pod) ? "new" : ""}">
+          <span class="name" title="${esc(p.pod)}">${esc(p.pod)}</span>
+          <span class="bar"><span style="width:${(100 * p.searches_last_minute / max).toFixed(1)}%"></span></span>
+          <span class="n">${p.searches_last_minute}</span>
+        </li>`).join("");
+      $("pods-summary").textContent =
+        `${plural(pods.length, "pod")} alive. ${total} ${total === 1 ? "search" : "searches"} in the last minute.`;
+      knownPods = new Set(pods.map(p => p.pod));
+    } catch (e) {
+      $("pods").innerHTML = "";
+      $("pods-summary").innerHTML = `<span class="error">Pod list unavailable: ${esc(e.message)}</span>`;
+    }
+  }
+
+  // ---------------------------------------------------------- coordinator nodes
+  async function loadNodes() {
+    try {
+      const { nodes } = await getJSON("/inventory/cluster");
+      $("nodes").innerHTML = nodes.map(n => {
+        if (!n.up) return `<div class="node down"><div class="num">${n.node_id}</div>
+            <div class="role"><span class="dot"></span>Not responding</div>
+            <div class="detail">Left out of elections until it returns</div></div>`;
+        const leader = n.role === "leader";
+        const locks = leader && n.locks ? n.locks.stats : null;
+        return `<div class="node ${leader ? "leader" : "follower"}"><div class="num">${n.node_id}</div>
+            <div class="role"><span class="dot"></span>${leader ? "Leader" : "Follower"}</div>
+            <div class="detail">${leader ? "Sending a beacon every 2 s" : `Last beacon ${n.seconds_since_beacon} s ago`}</div>
+            <div class="detail">${locks ? `${plural(locks.granted, "lock")} granted, ${locks.had_to_wait} had to wait`
+                                        : `${plural(n.stats.elections_started, "election")} run`}</div></div>`;
+      }).join("");
+    } catch (e) {
+      $("nodes").innerHTML = `<p class="error">Node status unavailable: ${esc(e.message)}</p>`;
+    }
+  }
+
+  // ---------------------------------------------------------- activity feed
+  let seenEvents = null;
+  async function loadActivity() {
+    try {
+      const { events } = await getJSON("/inventory/activity");
+      const key = (e) => e.time + e.text;
+      if (!events.length) {
+        $("feed").innerHTML = `<li><span></span><span class="what hint">Nothing yet. Start the simulator or reserve a medicine.</span></li>`;
+        return;
+      }
+      $("feed").innerHTML = events.map(e => `
+        <li class="${esc(e.kind)}${seenEvents && !seenEvents.has(key(e)) ? " fresh" : ""}">
+          <time datetime="${esc(e.time)}">${new Date(e.time).toLocaleTimeString([], { hour12: false })}</time>
+          <span class="what">${esc(e.text)}</span>
+          <span class="detail">${esc(e.detail)}</span>
+        </li>`).join("");
+      seenEvents = new Set(events.map(key));
+    } catch (e) {
+      $("feed").innerHTML = `<li><span></span><span class="error">Activity unavailable: ${esc(e.message)}</span></li>`;
+    }
+  }
+
+  // ---------------------------------------------------------- rush-hour test
+  const RUSH = { pharmacy: 1, medicine: "Insulin Glargine", stock: 5, customers: 20 };
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  async function currentStock() {
+    const qs = new URLSearchParams({ medicine: RUSH.medicine, lat: 0, lng: 0, limit: 50 });
+    const data = await getJSON(`/api/search?${qs}`);
+    const row = data.results.find(r => r.pharmacy_id === RUSH.pharmacy);
+    return row ? row.quantity : 0;          // sold-out pharmacies aren't listed
+  }
+
+  async function setStock(qty) {
+    // Goes through the normal pipeline: Pharmacy Service -> RabbitMQ -> consumer -> database
+    const res = await fetch("/pharmacy/stock", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pharmacy_id: RUSH.pharmacy, medicine: RUSH.medicine, quantity: qty }) });
+    if (!res.ok) throw new Error("couldn't send the stock update");
+    for (let i = 0; i < 50; i++) {
+      if (await currentStock() === qty) return;
+      await sleep(300);
+    }
+    throw new Error("the stock update didn't arrive; is the inventory consumer running?");
+  }
+
+  async function runRound(useLock) {
+    await setStock(RUSH.stock);
+    const started = performance.now();
+    // All customers press "Reserve" at the same moment
+    const outcomes = await Promise.all(Array.from({ length: RUSH.customers }, (_, i) =>
+      fetch(`/inventory/reserve?use_lock=${useLock}`, { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pharmacy_id: RUSH.pharmacy, medicine: RUSH.medicine, quantity: 1, customer: `rush${i + 1}` }) })
+        .then(r => r.status).catch(() => 0)));
+    const seconds = ((performance.now() - started) / 1000).toFixed(2);
+    await sleep(400);
+    return { succeeded: outcomes.filter(s => s === 200).length, soldOut: outcomes.filter(s => s === 409).length,
+             failed: outcomes.filter(s => s !== 200 && s !== 409).length, after: await currentStock(), seconds };
+  }
+
+  function renderRound(title, r, useLock) {
+    const over = Math.max(0, r.succeeded - RUSH.stock);
+    const people = Array.from({ length: RUSH.customers }, (_, i) =>
+      i < Math.min(r.succeeded, RUSH.stock) ? "got" : i < r.succeeded ? "over" : "out");
+    const verdict = over
+      ? `<p class="verdict bad">${r.succeeded} of ${RUSH.customers} customers were promised a strip, but there were only ${RUSH.stock}.
+           ${over} overbooked. Stock afterwards: ${r.after} (it should be 0, so some updates were lost).</p>`
+      : `<p class="verdict good">Exactly ${r.succeeded} of ${RUSH.customers} got a strip and ${r.soldOut} were told it's sold out.
+           Nobody overbooked. Stock afterwards: ${r.after}.</p>`;
+    const extra = r.failed ? ` ${plural(r.failed, "request")} failed outright.` : "";
+    return `<div class="rush-round"><h3>${title}</h3>${verdict}
+      <div class="people" aria-hidden="true">${people.map(c => `<span class="person ${c}"></span>`).join("")}</div>
+      <p class="hint" style="margin-top:6px">Took ${r.seconds} s.${extra}</p></div>`;
+  }
+
+  $("rush-run").addEventListener("click", async () => {
+    const btn = $("rush-run");
+    btn.disabled = true;
+    const out = $("rush-results");
+    try {
+      btn.textContent = "Running without the lock";
+      const noLock = await runRound(false);
+      out.innerHTML = renderRound("Without the lock", noLock, false);
+      btn.textContent = "Running with the lock";
+      const withLock = await runRound(true);
+      out.innerHTML += renderRound("With the lock (mutual exclusion)", withLock, true) + `
+        <div class="legend">
+          <span><span class="person got"></span>Got a strip</span>
+          <span><span class="person over"></span>Promised a strip that doesn't exist</span>
+          <span><span class="person out"></span>Told it's sold out</span>
+        </div>`;
+    } catch (e) {
+      out.innerHTML += `<p class="error">The test stopped: ${esc(e.message)}</p>`;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Run the test again";
+    }
+  });
+
+  // ---------------------------------------------------------- refresh loop
+  function refresh() { loadQueue(); loadPods(); loadNodes(); loadActivity(); }
+  refresh();
+  setInterval(() => { if (!document.hidden) refresh(); }, 2000);
+</script>
+</body>
+</html>

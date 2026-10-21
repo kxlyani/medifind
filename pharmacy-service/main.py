@@ -96,6 +96,23 @@ class Publisher:
                     time.sleep(0.5)
 
 
+    def queue_stats(self) -> dict:
+        """Ask RabbitMQ how many messages are waiting and how many consumers are listening.
+        A *passive* declare only inspects the queue; it never creates or changes it."""
+        with self._lock:
+            for attempt in (1, 2):
+                try:
+                    if not self.connected():
+                        self._connect()
+                    q = self._channel.queue_declare(queue=QUEUE_NAME, passive=True)
+                    return {"queue": QUEUE_NAME, "waiting": q.method.message_count,
+                            "consumers": q.method.consumer_count}
+                except Exception as e:
+                    self._conn = None
+                    if attempt == 2:
+                        raise RuntimeError(f"RabbitMQ unavailable: {type(e).__name__} {e}".strip())
+
+
 publisher = Publisher()
 
 
@@ -118,6 +135,17 @@ def startup():
 def health():
     return {"status": "ok", "pod": POD_NAME, "rabbitmq_connected": publisher.connected(),
             "events_published": publisher.published}
+
+
+@app.get("/queue")
+def queue():
+    """Live queue numbers for the System view page."""
+    try:
+        stats = publisher.queue_stats()
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    stats.update(published_by_this_pod=publisher.published, pod=POD_NAME)
+    return stats
 
 
 @app.post("/stock", status_code=202)
