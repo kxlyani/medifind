@@ -11,7 +11,7 @@ Write-Host "==> 2/5  Enabling metrics-server (needed by the autoscaler)"
 minikube addons enable metrics-server
 
 Write-Host "==> 3/5  Building images inside Minikube (no Docker Hub push needed)"
-foreach ($svc in "coordinator", "inventory-service", "search-service", "pharmacy-service", "simulator", "frontend") {
+foreach ($svc in "coordinator", "inventory-service", "search-service", "pharmacy-service", "notification-service", "simulator", "frontend") {
     Write-Host "    building medifind/${svc}:1.0"
     minikube image build -t "medifind/${svc}:1.0" ".\$svc"
     if ($LASTEXITCODE -ne 0) { throw "Build failed for $svc" }

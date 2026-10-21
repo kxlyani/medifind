@@ -41,6 +41,7 @@ from psycopg2.pool import ThreadedConnectionPool
 from pydantic import BaseModel, Field
 
 import activity
+import events
 from coordination import CoordinatorClient, LockUnavailable
 
 DB_HOST = os.getenv("DB_HOST", "postgres")
@@ -52,6 +53,7 @@ REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 CRITICAL_SECTION_DELAY_MS = int(os.getenv("CRITICAL_SECTION_DELAY_MS", "50"))
 DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "20"))
+RESERVATION_MINUTES = int(os.getenv("RESERVATION_MINUTES", "30"))   # how long a strip is held
 
 POD_NAME = socket.gethostname()  # in Kubernetes this is the pod name
 
@@ -108,10 +110,37 @@ def invalidate_cache(medicine: str):
         pass  # cached entries also expire on their own
 
 
+MIGRATIONS = [
+    # Added for "My reservations": who reserved, its state, and when the hold ends.
+    "ALTER TABLE reservations ADD COLUMN IF NOT EXISTS user_id VARCHAR(40)",
+    "ALTER TABLE reservations ADD COLUMN IF NOT EXISTS status VARCHAR(12) NOT NULL DEFAULT 'active'",
+    "ALTER TABLE reservations ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP",
+    "ALTER TABLE reservations ADD COLUMN IF NOT EXISTS closed_at TIMESTAMP",
+    "UPDATE reservations SET expires_at = created_at + INTERVAL '30 minutes' WHERE expires_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_reservations_user ON reservations (user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_reservations_active ON reservations (status, expires_at)",
+]
+
+
+def migrate():
+    """Bring an existing database up to date. Several Inventory pods start at once,
+    so a PostgreSQL advisory lock makes them take turns (only one changes the schema)."""
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_lock(4242)")
+            try:
+                for sql in MIGRATIONS:
+                    cur.execute(sql)
+                conn.commit()
+            finally:
+                cur.execute("SELECT pg_advisory_unlock(4242)")
+
+
 @app.on_event("startup")
 def startup():
     global pool
     pool = connect_with_retry()
+    migrate()
     print(f"[inventory] connected to DB, running on {POD_NAME}", flush=True)
 
 
@@ -142,13 +171,19 @@ def pharmacy_stock(pharmacy_id: int):
 
 
 @app.get("/pharmacies/{pharmacy_id}/reservations")
-def pharmacy_reservations(pharmacy_id: int, limit: int = Query(10, ge=1, le=50)):
+def pharmacy_reservations(pharmacy_id: int, limit: int = Query(12, ge=1, le=50)):
     rows = query(
-        "SELECT id, medicine_name AS medicine, quantity, customer, reserved_by, created_at "
-        "FROM reservations WHERE pharmacy_id = %s ORDER BY id DESC LIMIT %s", (pharmacy_id, limit))
-    for r in rows:
-        r["created_at"] = r["created_at"].isoformat()
-    return {"pharmacy_id": pharmacy_id, "reservations": rows}
+        "SELECT id, medicine_name AS medicine, quantity, customer, reserved_by, status, "
+        "created_at, expires_at, closed_at FROM reservations WHERE pharmacy_id = %s "
+        "ORDER BY (status = 'active') DESC, id DESC LIMIT %s", (pharmacy_id, limit))
+    return {"pharmacy_id": pharmacy_id, "reservations": [iso_dates(r) for r in rows]}
+
+
+def iso_dates(row: dict) -> dict:
+    for k in ("created_at", "expires_at", "closed_at", "updated_at"):
+        if row.get(k) is not None:
+            row[k] = row[k].isoformat()
+    return row
 
 
 @app.get("/medicines")
@@ -181,6 +216,7 @@ class ReservationRequest(BaseModel):
     medicine: str = Field(..., min_length=2, max_length=100)
     quantity: int = Field(1, ge=1, le=5)
     customer: str = Field("guest", max_length=50)
+    user_id: str | None = Field(None, max_length=40)    # this browser's id, for "My reservations"
 
 
 def reserve_critical_section(req: ReservationRequest) -> dict:
@@ -212,15 +248,19 @@ def reserve_critical_section(req: ReservationRequest) -> dict:
                 "WHERE pharmacy_id = %s AND medicine_name = %s",
                 (remaining, req.pharmacy_id, row["medicine_name"]))
             cur.execute(
-                "INSERT INTO reservations (pharmacy_id, medicine_name, quantity, customer, reserved_by) "
-                "VALUES (%s, %s, %s, %s, %s) RETURNING id",
-                (req.pharmacy_id, row["medicine_name"], req.quantity, req.customer, POD_NAME))
-            reservation_id = cur.fetchone()["id"]
+                "INSERT INTO reservations (pharmacy_id, medicine_name, quantity, customer, reserved_by, "
+                "user_id, status, expires_at) VALUES (%s, %s, %s, %s, %s, %s, 'active', "
+                "NOW() + make_interval(mins => %s)) RETURNING id, expires_at",
+                (req.pharmacy_id, row["medicine_name"], req.quantity, req.customer, POD_NAME,
+                 req.user_id, RESERVATION_MINUTES))
+            inserted = cur.fetchone()
+            reservation_id, expires_at = inserted["id"], inserted["expires_at"]
             cur.execute("SELECT name FROM pharmacies WHERE id = %s", (req.pharmacy_id,))
             pharmacy = cur.fetchone()["name"]
     invalidate_cache(row["medicine_name"])
     return {"reservation_id": reservation_id, "medicine": row["medicine_name"], "pharmacy": pharmacy,
-            "pharmacy_id": req.pharmacy_id, "quantity": req.quantity, "remaining": remaining}
+            "pharmacy_id": req.pharmacy_id, "quantity": req.quantity, "remaining": remaining,
+            "expires_at": expires_at.isoformat(), "hold_minutes": RESERVATION_MINUTES}
 
 
 @app.post("/reserve")
@@ -245,6 +285,97 @@ def reserve(req: ReservationRequest, use_lock: bool = True):
                     f"Handled by {POD_NAME} with a lock from coordinator node {held['leader_id']}. "
                     f"{result['remaining']} left.", pod=POD_NAME)
     return result
+
+
+# ------------------------------------------------------------------ my reservations
+@app.get("/reservations")
+def my_reservations(user_id: str = Query(..., min_length=4, max_length=40)):
+    """Everything this browser has reserved: active first, then the most recent closed ones."""
+    rows = query(
+        "SELECT r.id, r.pharmacy_id, p.name AS pharmacy, p.area, r.medicine_name AS medicine, r.quantity, "
+        "r.customer, r.status, r.created_at, r.expires_at, r.closed_at "
+        "FROM reservations r JOIN pharmacies p ON p.id = r.pharmacy_id WHERE r.user_id = %s "
+        "ORDER BY (r.status = 'active') DESC, r.id DESC LIMIT 30", (user_id,))
+    return {"reservations": [iso_dates(r) for r in rows], "hold_minutes": RESERVATION_MINUTES,
+            "server_time": time.time()}
+
+
+def close_reservation(reservation_id: int, new_status: str, actor: str, user_id: str | None = None) -> dict:
+    """Move an ACTIVE reservation to cancelled / expired / collected.
+
+    Cancelled and expired reservations give their strips BACK to the pharmacy's
+    stock, so this changes the same stock row that /reserve changes. It therefore
+    takes the same distributed lock: a cancel and a new reservation for the same
+    item can never interleave.
+    """
+    found = query("SELECT pharmacy_id, medicine_name, quantity, user_id, status FROM reservations WHERE id = %s",
+                  (reservation_id,))
+    if not found:
+        raise HTTPException(404, "No such reservation")
+    r = found[0]
+    if user_id is not None and r["user_id"] != user_id:
+        raise HTTPException(403, "That reservation belongs to someone else")
+    if r["status"] != "active":
+        raise HTTPException(409, f"Reservation is already {r['status']}")
+
+    resource = f"stock:{r['pharmacy_id']}:{r['medicine_name'].strip().lower()}"
+    try:
+        with coordinator.lock(resource) as held:
+            with db_conn() as conn:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    # Re-check inside the lock: another pod may have closed it meanwhile.
+                    cur.execute("UPDATE reservations SET status = %s, closed_at = NOW() "
+                                "WHERE id = %s AND status = 'active' RETURNING id", (new_status, reservation_id))
+                    if not cur.fetchone():
+                        raise HTTPException(409, "Reservation was already closed")
+                    remaining = None
+                    if new_status in ("cancelled", "expired"):
+                        cur.execute("UPDATE stock SET quantity = quantity + %s, updated_at = NOW() "
+                                    "WHERE pharmacy_id = %s AND medicine_name = %s RETURNING quantity",
+                                    (r["quantity"], r["pharmacy_id"], r["medicine_name"]))
+                        remaining = cur.fetchone()["quantity"]
+                    cur.execute("SELECT id, name, area, lat, lng FROM pharmacies WHERE id = %s", (r["pharmacy_id"],))
+                    pharmacy = dict(cur.fetchone())
+    except LockUnavailable as e:
+        raise HTTPException(503, f"Could not get lock: {e}")
+
+    if remaining is not None:
+        invalidate_cache(r["medicine_name"])
+        if remaining == r["quantity"]:
+            # Stock went from 0 back to > 0: tell subscribers (publish-subscribe).
+            events.publish_standalone(events.restock_event(pharmacy, r["medicine_name"], remaining, POD_NAME))
+    returned = f" {r['quantity']} back in stock ({remaining} now)." if remaining is not None else ""
+    activity.record(cache, new_status, f"{new_status.capitalize()} reservation R-{reservation_id}: "
+                    f"{r['medicine_name']} at {pharmacy['name']}",
+                    f"{actor}. Handled by {POD_NAME} with a lock from coordinator node {held['leader_id']}.{returned}",
+                    pod=POD_NAME)
+    return {"reservation_id": reservation_id, "status": new_status, "stock_now": remaining}
+
+
+@app.post("/reservations/{reservation_id}/cancel")
+def cancel_reservation(reservation_id: int, user_id: str = Query(..., min_length=4, max_length=40)):
+    return close_reservation(reservation_id, "cancelled", "Cancelled by the customer", user_id)
+
+
+@app.post("/reservations/{reservation_id}/collect")
+def collect_reservation(reservation_id: int):
+    """The pharmacy hands the medicine over (pharmacy portal)."""
+    return close_reservation(reservation_id, "collected", "Collected at the counter")
+
+
+@app.post("/jobs/expire-reservations")
+def expire_reservations(scheduled_by: int = 0):
+    """Release holds that ran out. Called every 15 s by the coordinator LEADER only,
+    so exactly one place in the whole system schedules this job (section 24)."""
+    due = query("SELECT id FROM reservations WHERE status = 'active' AND expires_at < NOW() ORDER BY id LIMIT 50")
+    expired = 0
+    for row in due:
+        try:
+            close_reservation(row["id"], "expired", f"Hold time ran out. Job scheduled by coordinator node {scheduled_by}")
+            expired += 1
+        except HTTPException:
+            pass   # closed by someone else in the meantime
+    return {"expired": expired, "checked": len(due), "run_by": POD_NAME}
 
 
 @app.get("/activity")

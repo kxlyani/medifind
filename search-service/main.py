@@ -22,12 +22,14 @@ Distributed Systems ideas shown here:
   * Graceful degradation: if Redis is down we still answer from Inventory
   * Load balancing: "served_by" shows which replica answered
 """
+import itertools
 import json
 import math
 import os
 import socket
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import redis
@@ -174,6 +176,17 @@ def areas():
     return sorted(out, key=lambda a: a["area"])
 
 
+def lookup_stock(medicine: str) -> tuple[dict, str]:
+    """Pharmacies that have this medicine: from Redis if cached, otherwise from Inventory."""
+    key = cache_key(medicine)
+    cached, redis_ok = cache_get(key)
+    if cached is not None:
+        return cached, "cache"
+    data = call_inventory("/stock", {"medicine": medicine})
+    cache_set(key, data)
+    return data, ("db" if redis_ok else "db (cache unavailable)")
+
+
 @app.get("/search")
 def search(
     medicine: str = Query(..., min_length=2),
@@ -182,15 +195,7 @@ def search(
     limit: int = Query(10, ge=1, le=50),
 ):
     count_request()
-    key = cache_key(medicine)
-    cached, redis_ok = cache_get(key)
-
-    if cached is not None:
-        source, data = "cache", cached
-    else:
-        data = call_inventory("/stock", {"medicine": medicine})
-        cache_set(key, data)
-        source = "db" if redis_ok else "db (cache unavailable)"
+    data, source = lookup_stock(medicine)
 
     results = []
     for r in data["results"]:
@@ -206,4 +211,122 @@ def search(
         "served_by": POD_NAME,                # which Search replica answered
         "inventory_pod": data.get("served_by"),
         "results": results[:limit],
+    }
+
+
+# ------------------------------------------------------------------ prescription search
+# SCATTER-GATHER: a prescription has several medicines. Instead of looking them
+# up one after another, we send all the lookups at the same time (scatter),
+# wait for every answer, then merge them into one result (gather). The total
+# time is roughly the SLOWEST lookup, not the SUM of all of them.
+MAX_MEDICINES = 8
+
+
+def route_km(lat: float, lng: float, stops: list[dict]) -> float:
+    """Distance of going from the user to each stop in order."""
+    total, here = 0.0, (lat, lng)
+    for s in stops:
+        total += distance_km(here[0], here[1], s["lat"], s["lng"])
+        here = (s["lat"], s["lng"])
+    return round(total, 2)
+
+
+def fewest_stops(wanted: list[str], pharmacies: list[dict], lat: float, lng: float) -> dict:
+    """No single pharmacy has everything: find the shortest trip with as few stops as possible."""
+    need = set(wanted)
+    best = None
+    # Two stops is the usual answer, so try every pair and both visiting orders.
+    for a, b in itertools.combinations(pharmacies, 2):
+        if need <= set(a["has"]) | set(b["has"]):
+            for order in ((a, b), (b, a)):
+                km = route_km(lat, lng, list(order))
+                if best is None or km < best[0]:
+                    best = (km, list(order))
+    if best:
+        stops = best[1]
+    else:
+        # Rare: needs 3 or more stops. Greedy: keep picking the pharmacy that
+        # covers the most of what's still missing (nearest first on ties).
+        stops, left, here = [], set(need), (lat, lng)
+        while left:
+            pick = max(pharmacies, key=lambda p: (len(left & set(p["has"])),
+                                                 -distance_km(here[0], here[1], p["lat"], p["lng"])))
+            if not left & set(pick["has"]):
+                break
+            stops.append(pick)
+            left -= set(pick["has"])
+            here = (pick["lat"], pick["lng"])
+    # Say which medicines to buy at which stop (each medicine at its first stop that has it).
+    plan, left = [], list(wanted)
+    for stop in stops:
+        here_items = [m for m in left if m in stop["has"]]
+        left = [m for m in left if m not in here_items]
+        plan.append({**{k: stop[k] for k in ("pharmacy_id", "pharmacy", "area", "lat", "lng", "distance_km")},
+                     "buy": [{"medicine": stop["names"][m], "quantity": stop["has"][m]} for m in here_items]})
+    return {"stops": plan, "route_km": route_km(lat, lng, stops)}
+
+
+@app.get("/prescription")
+def prescription(
+    medicines: str = Query(..., min_length=2, description="comma-separated medicine names"),
+    lat: float = Query(..., ge=-90, le=90),
+    lng: float = Query(..., ge=-180, le=180),
+):
+    names, seen = [], set()
+    for raw in medicines.split(","):
+        name = raw.strip()
+        if len(name) >= 2 and name.lower() not in seen:
+            seen.add(name.lower())
+            names.append(name)
+    if not names:
+        raise HTTPException(422, "Add at least one medicine")
+    if len(names) > MAX_MEDICINES:
+        raise HTTPException(422, f"At most {MAX_MEDICINES} medicines at a time")
+    count_request()
+
+    def timed_lookup(name: str) -> dict:
+        t0 = time.perf_counter()
+        data, source = lookup_stock(name)
+        return {"medicine": name, "data": data, "source": source,
+                "ms": round((time.perf_counter() - t0) * 1000, 1)}
+
+    # SCATTER: one lookup per medicine, all at once
+    started = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=len(names)) as workers:
+        answers = list(workers.map(timed_lookup, names))
+    parallel_ms = round((time.perf_counter() - started) * 1000, 1)
+
+    # GATHER: merge everything into one view per pharmacy
+    pharmacies: dict[int, dict] = {}
+    for ans in answers:
+        key = ans["medicine"].lower()
+        for r in ans["data"]["results"]:
+            p = pharmacies.setdefault(r["pharmacy_id"], {
+                "pharmacy_id": r["pharmacy_id"], "pharmacy": r["pharmacy"], "area": r["area"],
+                "lat": r["lat"], "lng": r["lng"], "distance_km": distance_km(lat, lng, r["lat"], r["lng"]),
+                "has": {}, "names": {}})
+            p["has"][key] = r["quantity"]
+            p["names"][key] = r["medicine"]           # the spelling stored in the database
+
+    wanted = [a["medicine"].lower() for a in answers if a["data"]["results"]]
+    missing = [a["medicine"] for a in answers if not a["data"]["results"]]
+    everyone = sorted(pharmacies.values(), key=lambda p: p["distance_km"])
+
+    def public(p: dict) -> dict:
+        return {**{k: p[k] for k in ("pharmacy_id", "pharmacy", "area", "lat", "lng", "distance_km")},
+                "items": [{"medicine": p["names"][m], "quantity": p["has"][m]} for m in wanted if m in p["has"]]}
+
+    all_in_one = [public(p) for p in everyone if wanted and set(wanted) <= set(p["has"])][:5]
+    plan = fewest_stops(wanted, everyone, lat, lng) if wanted and not all_in_one else None
+
+    return {
+        "medicines": names,
+        "lookups": [{"medicine": a["medicine"], "source": a["source"], "ms": a["ms"],
+                     "pharmacies": len(a["data"]["results"])} for a in answers],
+        "parallel_ms": parallel_ms,
+        "one_by_one_ms": round(sum(a["ms"] for a in answers), 1),
+        "all_in_one": all_in_one,
+        "plan": plan,
+        "missing": missing,
+        "served_by": POD_NAME,
     }

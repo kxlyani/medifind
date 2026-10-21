@@ -12,6 +12,8 @@
     <a class="brand" href="/"><span class="cross" aria-hidden="true"></span>MediFind</a>
     <nav aria-label="Pages">
       <a href="/">Find medicine</a>
+      <a href="prescription.html">Prescription</a>
+      <a href="mine.html">My reservations</a>
       <a href="pharmacy.html">Pharmacy portal</a>
       <a href="system.html" aria-current="page">System view</a>
     </nav>
@@ -45,14 +47,15 @@
         <section class="panel" aria-labelledby="n-title">
           <h2 id="n-title">Coordinator nodes</h2>
           <p>Three nodes elect a leader with the Bully algorithm. The leader sends a beacon every
-             2 seconds and hands out the locks that stop two people reserving the same last strip.</p>
+             2 seconds, hands out the locks that stop two people reserving the same last strip, and is the
+             only node that schedules the clean-up of expired reservations.</p>
           <div class="nodes" id="nodes"></div>
         </section>
       </div>
 
       <section class="panel" aria-labelledby="a-title">
         <h2 id="a-title">Activity</h2>
-        <p>Every stock update the consumers save and every reservation, newest first, from all pods.</p>
+        <p>Every stock update, reservation, cancellation, expiry and restock alert, newest first, from all pods.</p>
         <ol class="feed" id="feed"></ol>
       </section>
     </div>
@@ -137,7 +140,9 @@
             <div class="role"><span class="dot"></span>${leader ? "Leader" : "Follower"}</div>
             <div class="detail">${leader ? "Sending a beacon every 2 s" : `Last beacon ${n.seconds_since_beacon} s ago`}</div>
             <div class="detail">${locks ? `${plural(locks.granted, "lock")} granted, ${locks.had_to_wait} had to wait`
-                                        : `${plural(n.stats.elections_started, "election")} run`}</div></div>`;
+                                        : `${plural(n.stats.elections_started, "election")} run`}</div>
+            ${leader && n.job ? `<div class="detail">Runs the reservation clean-up every 15 s: last run
+                ${n.job.seconds_ago} s ago${n.job.ok ? (n.job.expired ? `, released ${n.job.expired}` : "") : ", failed"}</div>` : ""}</div>`;
       }).join("");
     } catch (e) {
       $("nodes").innerHTML = `<p class="error">Node status unavailable: ${esc(e.message)}</p>`;

@@ -30,6 +30,7 @@ Browser ─► Frontend (Nginx) ─► Search Service (×2–5, autoscaled) ◄�
 | `coordinator` (×3) | RPC, beacon protocol, Bully leader election, mutual exclusion (lock manager) | 9000 |
 | `inventory-consumer` | Reads events from RabbitMQ, saves to DB, clears cache | — |
 | `pharmacy-service` | Accepts stock updates, publishes events | 8003 |
+| `notification-service` | "Notify me when it's back": subscribes to restock events | 8004 |
 | `simulator` | 20 fake pharmacies sending updates | — |
 | PostgreSQL, RabbitMQ, Redis | Database, message broker, cache | 5432, 5672/15672, 6379 |
 
@@ -69,13 +70,14 @@ python demo/race_test.py --url <frontend-url>    # overbooking without the lock,
 ## DS concepts demonstrated
 
 **RPC** · **message-oriented communication** · **mutual exclusion** · **beacon protocol** ·
-**Bully algorithm** · microservices · many producers · competing consumers ·
+**Bully algorithm** · **publish–subscribe** · **scatter–gather** · leader-only scheduled job · microservices · many producers · competing consumers ·
 horizontal scaling and autoscaling (HPA) · load balancing · service discovery · shared cache
 with invalidation · eventual consistency · at-least-once delivery · idempotency ·
 last-write-wins ordering · fault tolerance and graceful degradation · self-healing.
 
 See [GUIDE.md](GUIDE.md) §17 for where each one appears in the code, and §22 for the
-coordination algorithms.
+coordination algorithms, and §24 for the patient features (restock alerts, prescription search,
+my reservations).
 
 ## Project structure
 
@@ -86,8 +88,9 @@ medifind/
 ├── inventory-service/          main.py (REST API + reservations), consumer.py, coordination.py (RPC client)
 ├── search-service/             main.py (search + cache)
 ├── pharmacy-service/           main.py (event producer)
+├── notification-service/       main.py (restock alerts, subscribes to stock.events)
 ├── simulator/                  simulate.py
-├── frontend/                   nginx.conf, site/ (index.html, pharmacy.html, system.html, assets/, fonts/)
+├── frontend/                   nginx.conf, site/ (index, prescription, mine, pharmacy, system pages; assets/, fonts/)
 ├── k8s/                        Kubernetes manifests + HPA
 ├── scripts/                    deploy.sh, deploy.ps1, teardown.sh
 ├── loadtest/locustfile.py      load test

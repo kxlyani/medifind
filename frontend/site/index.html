@@ -12,6 +12,8 @@
     <a class="brand" href="/"><span class="cross" aria-hidden="true"></span>MediFind</a>
     <nav aria-label="Pages">
       <a href="/" aria-current="page">Find medicine</a>
+      <a href="prescription.html">Prescription</a>
+      <a href="mine.html">My reservations</a>
       <a href="pharmacy.html">Pharmacy portal</a>
       <a href="system.html">System view</a>
     </nav>
@@ -41,10 +43,12 @@
     <div class="receipt" id="receipt" role="status"></div>
     <ol class="results" id="results"></ol>
     <p class="hint" id="hint">Type a medicine and pick where you are. You'll see every pharmacy that has it right now, nearest first, and you can reserve a strip before you leave home.</p>
+    <div class="notify" id="notify" hidden></div>
 
   </main>
 </div>
 
+<script src="assets/common.js"></script>
 <script>
   // All requests go through Nginx: /api -> Search Service, /inventory -> Inventory Service.
   const API = "/api";
@@ -61,6 +65,9 @@
       ]);
       $("medicine-list").innerHTML = meds.map(m => `<option value="${esc(m)}">`).join("");
       $("area").innerHTML = areas.map(a => `<option value="${a.lat},${a.lng}">${esc(a.area)}</option>`).join("");
+      // Arriving from an alert or the prescription page: /?medicine=Dolo%20650
+      const wanted = new URLSearchParams(location.search).get("medicine");
+      if (wanted) { $("medicine").value = wanted; search(); }
     } catch (e) {
       showHint("Couldn't reach the search service. Check that it's running, then reload the page.", true);
     }
@@ -117,10 +124,14 @@
 
       if (!data.results.length) {
         $("results").innerHTML = "";
-        showHint(`No pharmacy near ${areaName} has ${medicine} right now. Turn on live refresh to see the moment someone restocks it.`);
+        showHint(`No pharmacy near ${areaName} has ${medicine} right now.`);
+        $("notify").hidden = false;
+        $("notify").innerHTML = `<button class="btn" type="button" id="notify-btn">Notify me when it's back</button>
+          <p class="hint">We'll show an alert on this page as soon as any pharmacy restocks it.</p>`;
         return;
       }
       showHint("");
+      $("notify").hidden = true;
       const sameSearch = lastMedicine === medicine.toLowerCase();
       const changed = (r) => sameSearch && lastSeen[r.pharmacy_id] !== undefined
                              && lastSeen[r.pharmacy_id] !== `${r.quantity}|${r.updated_at}`;
@@ -160,22 +171,39 @@
     try {
       const res = await fetch("/inventory/reserve", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pharmacy_id: +btn.dataset.id, medicine: btn.dataset.med, quantity: 1 }),
+        body: JSON.stringify({ pharmacy_id: +btn.dataset.id, medicine: btn.dataset.med, quantity: 1,
+                               user_id: MF.userId(), customer: MF.customerName() }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || res.statusText);
       const pockets = btn.closest(".row").querySelectorAll(".pocket.full");
       if (pockets.length) pockets[pockets.length - 1].classList.add("pop");
       btn.textContent = "Reserved";
+      const until = MF.utc(data.expires_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
       receipt(`<strong>Reserved 1 strip of ${esc(data.medicine)} at ${esc(btn.dataset.name)}</strong>
-               <span>Show reservation R-${data.reservation_id} at the counter. ${data.remaining} left.
-               Lock granted by coordinator node ${data.lock.granted_by_node}
-               (see <a href="system.html">System view</a>).</span>`, true);
+               <span>Show reservation R-${data.reservation_id} at the counter before ${until}
+               (held for ${data.hold_minutes} minutes). ${data.remaining} left.
+               Lock granted by coordinator node ${data.lock.granted_by_node}.
+               <a href="mine.html">See my reservations</a></span>`, true);
       setTimeout(search, 650);
     } catch (err) {
       receipt(`<strong>Couldn't reserve ${esc(btn.dataset.med)}</strong><span>${esc(err.message)}</span>`, false);
       btn.disabled = false;
       btn.textContent = "Reserve 1";
+    }
+  });
+
+  // "Notify me when it's back": a subscription in the Notification Service
+  $("notify").addEventListener("click", async (e) => {
+    if (!e.target.closest("#notify-btn")) return;
+    const medicine = $("medicine").value.trim();
+    const [lat, lng] = $("area").value.split(",").map(Number);
+    try {
+      await MF.subscribe(medicine, { name: $("area").selectedOptions[0]?.textContent, lat, lng });
+      $("notify").innerHTML = `<p class="hint">Done. We'll tell you here when ${esc(medicine)} is back.
+        You can see or stop this alert on <a href="mine.html">My reservations</a>.</p>`;
+    } catch (err) {
+      $("notify").innerHTML = `<p class="hint error">Couldn't set the alert: ${esc(err.message)}</p>`;
     }
   });
 
@@ -185,6 +213,7 @@
     if (e.target.checked) timer = setInterval(search, 3000);
   });
   loadOptions();
+  MF.startAlerts();
 </script>
 </body>
 </html>

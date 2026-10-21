@@ -46,6 +46,8 @@ spec:
             # NODE_ID is worked out from the pod name (coordinator-N -> N+1)
             - name: PEERS
               valueFrom: { configMapKeyRef: { name: medifind-config, key: COORDINATOR_PEERS } }
+            - name: EXPIRY_JOB_URL          # called only while this node is the leader
+              valueFrom: { configMapKeyRef: { name: medifind-config, key: EXPIRY_JOB_URL } }
           readinessProbe:
             tcpSocket: { port: 9000 }
             periodSeconds: 5

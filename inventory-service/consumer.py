@@ -29,6 +29,7 @@ import psycopg2
 import redis
 
 import activity
+import events
 
 DB = dict(
     host=os.getenv("DB_HOST", "postgres"),
@@ -80,7 +81,7 @@ class Consumer:
         self.cache = redis.Redis(host=REDIS_HOST, port=REDIS_PORT,
                                  socket_timeout=1, socket_connect_timeout=1)
         self.processed = 0
-        self.pharmacy_names: dict[int, str] = {}   # small cache for the activity log
+        self.pharmacies: dict[int, dict] = {}     # small cache: id -> name, area, lat, lng
 
     def canonical_name(self, cur, medicine: str) -> str:
         """Reuse the existing spelling so 'dolo 650' and 'Dolo 650' stay one row."""
@@ -89,24 +90,30 @@ class Consumer:
         row = cur.fetchone()
         return row[0] if row else medicine
 
-    def save(self, event: dict) -> tuple[str, bool]:
-        """Returns (medicine name as stored, whether the update was applied)."""
+    def save(self, event: dict) -> tuple[str, bool, int | None]:
+        """Returns (medicine name as stored, whether the update was applied, previous quantity)."""
         ts = datetime.fromisoformat(event["timestamp"]).replace(tzinfo=None)
         with self.db.cursor() as cur:
             name = self.canonical_name(cur, event["medicine"])
+            cur.execute("SELECT quantity FROM stock WHERE pharmacy_id = %s AND medicine_name = %s",
+                        (event["pharmacy_id"], name))
+            row = cur.fetchone()
+            previous = row[0] if row else None
             cur.execute(UPSERT_SQL, (event["pharmacy_id"], name, event["quantity"], ts))
             applied = cur.rowcount == 1
         self.db.commit()
-        return name, applied
+        return name, applied, previous
 
-    def pharmacy_name(self, pharmacy_id: int) -> str:
-        if pharmacy_id not in self.pharmacy_names:
+    def pharmacy(self, pharmacy_id: int) -> dict:
+        if pharmacy_id not in self.pharmacies:
             with self.db.cursor() as cur:
-                cur.execute("SELECT name FROM pharmacies WHERE id = %s", (pharmacy_id,))
+                cur.execute("SELECT id, name, area, lat, lng FROM pharmacies WHERE id = %s", (pharmacy_id,))
                 row = cur.fetchone()
             self.db.commit()
-            self.pharmacy_names[pharmacy_id] = row[0] if row else f"Pharmacy {pharmacy_id}"
-        return self.pharmacy_names[pharmacy_id]
+            self.pharmacies[pharmacy_id] = (
+                dict(zip(("id", "name", "area", "lat", "lng"), row)) if row
+                else {"id": pharmacy_id, "name": f"Pharmacy {pharmacy_id}", "area": "", "lat": 0, "lng": 0})
+        return self.pharmacies[pharmacy_id]
 
     def invalidate_cache(self, medicine: str):
         try:
@@ -135,7 +142,7 @@ class Consumer:
 
         # 2. Save to the database.
         try:
-            name, applied = self.save(event)
+            name, applied, previous = self.save(event)
         except psycopg2.errors.ForeignKeyViolation:
             self.db.rollback()
             print(f"[consumer] unknown pharmacy {event['pharmacy_id']}, dropping event", flush=True)
@@ -154,9 +161,15 @@ class Consumer:
             self.db = wait_for("PostgreSQL", lambda: psycopg2.connect(**DB))
             return
 
-        # 3. Clear the cache, then ACK. ACK last = at-least-once delivery.
+        # 3. Clear the cache. If the medicine was sold out here and is now back,
+        #    PUBLISH a "restocked" event for anyone subscribed (publish-subscribe).
+        #    Then ACK. ACK last = at-least-once delivery.
+        pharmacy = self.pharmacy(event["pharmacy_id"])
+        restocked = applied and event["quantity"] > 0 and not previous
         if applied:
             self.invalidate_cache(name)
+        if restocked:
+            events.publish(ch, events.restock_event(pharmacy, name, event["quantity"], POD_NAME))
         ch.basic_ack(delivery_tag=method.delivery_tag)
         self.processed += 1
         status = "applied" if applied else "skipped (older than stored data)"
@@ -166,13 +179,13 @@ class Consumer:
         # 4. Record it for the live activity feed (how long since the pharmacy sent it).
         sent = datetime.fromisoformat(event["timestamp"])
         delay_ms = max(0, round((datetime.now(timezone.utc) - sent).total_seconds() * 1000))
-        pharmacy = self.pharmacy_name(event["pharmacy_id"])
         if applied:
-            activity.record(self.cache, "update", f"{pharmacy} set {name} to {event['quantity']}",
-                            f"Saved by {POD_NAME}, {delay_ms} ms after the pharmacy sent it",
+            back = " Back in stock, so a restock event was published." if restocked else ""
+            activity.record(self.cache, "update", f"{pharmacy['name']} set {name} to {event['quantity']}",
+                            f"Saved by {POD_NAME}, {delay_ms} ms after the pharmacy sent it.{back}",
                             pod=POD_NAME, delay_ms=delay_ms)
         else:
-            activity.record(self.cache, "skipped", f"Ignored an out-of-date update for {name} at {pharmacy}",
+            activity.record(self.cache, "skipped", f"Ignored an out-of-date update for {name} at {pharmacy['name']}",
                             f"A newer update was already saved. Checked by {POD_NAME}.", pod=POD_NAME)
 
     def run(self):
@@ -183,6 +196,7 @@ class Consumer:
                     host=RABBITMQ_HOST, port=RABBITMQ_PORT, credentials=creds, heartbeat=30))
                 ch = conn.channel()
                 ch.queue_declare(queue=QUEUE_NAME, durable=True)
+                events.declare_exchange(ch)          # where "restocked" events are published
                 # prefetch: each consumer holds at most 5 un-ACKed messages,
                 # so work spreads fairly across all consumer pods.
                 ch.basic_qos(prefetch_count=5)

@@ -1,0 +1,44 @@
+# Notification Service: "Notify me when it's back".
+# Subscribes to the stock.events fanout exchange in RabbitMQ (publish-subscribe)
+# and creates alerts for patients waiting for a medicine that was just restocked.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-service
+  namespace: medifind
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: notification-service }
+  template:
+    metadata:
+      labels: { app: notification-service }
+    spec:
+      containers:
+        - name: notification-service
+          image: medifind/notification-service:1.0
+          imagePullPolicy: IfNotPresent
+          ports: [{ containerPort: 8004 }]
+          envFrom:
+            - configMapRef: { name: medifind-config }
+            - secretRef: { name: medifind-secret }
+          readinessProbe:
+            httpGet: { path: /health, port: 8004 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: 8004 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 250m, memory: 128Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notification-service
+  namespace: medifind
+spec:
+  selector: { app: notification-service }
+  ports: [{ port: 8004, targetPort: 8004 }]

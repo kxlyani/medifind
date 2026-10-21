@@ -12,6 +12,8 @@
     <a class="brand" href="/"><span class="cross" aria-hidden="true"></span>MediFind</a>
     <nav aria-label="Pages">
       <a href="/">Find medicine</a>
+      <a href="prescription.html">Prescription</a>
+      <a href="mine.html">My reservations</a>
       <a href="pharmacy.html" aria-current="page">Pharmacy portal</a>
       <a href="system.html">System view</a>
     </nav>
@@ -44,7 +46,7 @@
 
     <section class="panel" aria-labelledby="b-title" style="margin-bottom: 56px">
       <h2 id="b-title">Recent reservations</h2>
-      <p>Customers who reserved here. They'll show the reservation number at your counter.</p>
+      <p>Customers who reserved here. They'll show the reservation number at your counter; mark it collected when you hand it over. Holds that aren't collected in time are released automatically.</p>
       <ul class="bookings" id="bookings"></ul>
     </section>
   </main>
@@ -171,14 +173,35 @@
   async function loadBookings() {
     try {
       const { reservations } = await getJSON(`/inventory/pharmacies/${pharmacyId()}/reservations`);
+      const labels = { active: "Held", cancelled: "Cancelled", expired: "Expired", collected: "Collected" };
       $("bookings").innerHTML = reservations.length
-        ? reservations.map(r => `<li><strong>R-${r.id}</strong>: ${r.quantity} ${r.quantity === 1 ? "strip" : "strips"} of
-            ${esc(r.medicine)} <span>for ${esc(r.customer)}, ${timeAgo(r.created_at)}</span></li>`).join("")
+        ? reservations.map(r => {
+            const left = r.expires_at ? Math.round((new Date(r.expires_at + "Z") - Date.now()) / 60000) : null;
+            const note = r.status === "active"
+              ? (left > 0 ? `held for ${left} more min` : "hold time is up")
+              : `${labels[r.status].toLowerCase()} ${timeAgo(r.closed_at || r.created_at)}`;
+            return `<li><strong>R-${r.id}</strong>: ${r.quantity} ${r.quantity === 1 ? "strip" : "strips"} of
+              ${esc(r.medicine)} <span>for ${esc(r.customer)}, ${note}.</span>
+              <span class="tag ${r.status}">${labels[r.status] || esc(r.status)}</span>
+              ${r.status === "active" ? `<button class="link" type="button" data-collect="${r.id}">Mark collected</button>` : ""}</li>`;
+          }).join("")
         : `<li class="hint">No reservations yet. They appear here when customers press Reserve on the Find medicine page.</li>`;
     } catch (e) {
       $("bookings").innerHTML = `<li class="error">Couldn't load reservations: ${esc(e.message)}</li>`;
     }
   }
+
+  // The customer picked up the medicine: close the hold (the strip stays sold).
+  $("bookings").addEventListener("click", async (e) => {
+    const b = e.target.closest("[data-collect]");
+    if (!b) return;
+    b.disabled = true;
+    try {
+      const res = await fetch(`/inventory/reservations/${b.dataset.collect}/collect`, { method: "POST" });
+      if (!res.ok) throw new Error((await res.json()).detail);
+    } catch (err) { b.textContent = `Couldn't mark it: ${err.message}`; return; }
+    loadBookings();
+  });
 
   $("pharmacy").addEventListener("change", () => {
     history.replaceState(null, "", `?id=${pharmacyId()}`);

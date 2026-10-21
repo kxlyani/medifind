@@ -24,7 +24,13 @@ classic Distributed Systems algorithms:
        COORDINATOR to everyone.
      * When a higher node comes back, it "bullies" its way to leadership.
 
-4. Mutual exclusion (centralized algorithm)
+4. Leader-only scheduled job
+   Every JOB_INTERVAL seconds the LEADER (and only the leader) asks the
+   Inventory Service to expire reservations whose hold time ran out. If the
+   leader dies, the newly elected leader simply carries on scheduling it, so
+   the job never runs twice at once and never stops for long.
+
+5. Mutual exclusion (centralized algorithm)
    The current leader acts as the LOCK MANAGER. A client asks
    acquire("stock:3:dolo 650"). If nobody holds that lock it is GRANTED;
    otherwise the request waits in a FIFO QUEUE. release() hands the lock to the
@@ -35,11 +41,13 @@ Configuration (environment variables):
   PEERS     all nodes, e.g. "1=coordinator-1:9000,2=coordinator-2:9000,3=coordinator-3:9000"
   PORT      port to listen on (default 9000)
 """
+import json
 import os
 import socket
 import sys
 import threading
 import time
+import urllib.request
 from collections import defaultdict, deque
 from socketserver import ThreadingMixIn
 from xmlrpc.client import ServerProxy, Transport
@@ -52,6 +60,8 @@ ELECTION_WAIT = float(os.getenv("ELECTION_WAIT", "4"))       # how long to wait 
 RPC_TIMEOUT = float(os.getenv("RPC_TIMEOUT", "1"))           # an unanswered RPC = node is down
 LOCK_LEASE = float(os.getenv("LOCK_LEASE", "5"))             # max time a lock can be held
 PORT = int(os.getenv("PORT", "9000"))
+EXPIRY_JOB_URL = os.getenv("EXPIRY_JOB_URL", "")                 # empty = job disabled
+JOB_INTERVAL = float(os.getenv("JOB_INTERVAL", "15"))             # leader runs the clean-up every 15 s
 
 
 def detect_node_id() -> int:
@@ -186,7 +196,9 @@ class Node:
         self.beacon_seq = 0
         self.started = time.time()
         self.stats = {"elections_started": 0, "times_became_leader": 0,
-                      "beacons_sent": 0, "beacons_received": 0}
+                      "beacons_sent": 0, "beacons_received": 0, "jobs_run": 0}
+        self.last_job_at = 0.0
+        self.job: dict | None = None
         self.mutex = MutexManager(self.log)
 
     # ---------- helpers
@@ -265,6 +277,7 @@ class Node:
             time.sleep(BEACON_INTERVAL)
             if self.is_leader():
                 self.send_beacons()
+                self.maybe_run_job()
             else:
                 age = time.time() - self.last_beacon
                 if (self.leader_id is None or age > BEACON_TIMEOUT) and not self.election_running:
@@ -292,6 +305,29 @@ class Node:
             t.join(RPC_TIMEOUT + 0.5)
         self.stats["beacons_sent"] += 1
         self.log(f"BEACON #{self.beacon_seq} sent, alive followers: {sorted(reached) or 'none'}")
+
+    # ---------- Leader-only job
+    def maybe_run_job(self):
+        if not EXPIRY_JOB_URL or time.time() - self.last_job_at < JOB_INTERVAL:
+            return
+        self.last_job_at = time.time()
+        self.spawn(self.run_job)
+
+    def run_job(self):
+        url = f"{EXPIRY_JOB_URL}?scheduled_by={MY_ID}"
+        try:
+            req = urllib.request.Request(url, data=b"", method="POST")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read())
+            self.stats["jobs_run"] += 1
+            self.job = {"last_run": time.time(), "ok": True, "expired": result.get("expired", 0),
+                        "run_by": result.get("run_by", "")}
+            if result.get("expired"):
+                self.log(f"JOB: reservation clean-up expired {result['expired']} hold(s) "
+                         f"(run by {result.get('run_by')})")
+        except Exception as e:
+            self.job = {"last_run": time.time(), "ok": False, "error": str(e)}
+            self.log(f"JOB: reservation clean-up failed: {e}")
 
     # ---------- RPC handlers (called BY other nodes / clients)
     def rpc_election(self, sender: int) -> str:
@@ -353,6 +389,8 @@ class Node:
             "uptime_s": round(time.time() - self.started),
             "stats": dict(self.stats),
             "locks": self.mutex.snapshot() if self.is_leader() else None,
+            "job": (dict(self.job, seconds_ago=round(time.time() - self.job["last_run"], 1))
+                    if self.is_leader() and self.job else None),
         }
 
 

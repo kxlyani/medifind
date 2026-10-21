@@ -69,16 +69,19 @@ services:
     environment:
       NODE_ID: "1"
       PEERS: "1=coordinator-1:9000,2=coordinator-2:9000,3=coordinator-3:9000"
+      EXPIRY_JOB_URL: http://inventory-service:8001/jobs/expire-reservations   # used only while leader
   coordinator-2:
     <<: *coordinator
     environment:
       NODE_ID: "2"
       PEERS: "1=coordinator-1:9000,2=coordinator-2:9000,3=coordinator-3:9000"
+      EXPIRY_JOB_URL: http://inventory-service:8001/jobs/expire-reservations   # used only while leader
   coordinator-3:
     <<: *coordinator
     environment:
       NODE_ID: "3"
       PEERS: "1=coordinator-1:9000,2=coordinator-2:9000,3=coordinator-3:9000"
+      EXPIRY_JOB_URL: http://inventory-service:8001/jobs/expire-reservations   # used only while leader
 
   # ---------- application services ----------
   inventory-service:
@@ -86,6 +89,7 @@ services:
     environment:
       <<: *common-env
       CRITICAL_SECTION_DELAY_MS: "50"
+      RESERVATION_MINUTES: "30"   # how long a reservation is held; set "2" to demo expiry quickly
     deploy:
       replicas: 2              # two copies, so the lock must work ACROSS processes
     depends_on:
@@ -121,10 +125,17 @@ services:
     depends_on:
       rabbitmq: { condition: service_healthy }
 
+  notification-service:
+    build: ./notification-service
+    environment: *common-env
+    depends_on:
+      postgres: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+
   frontend:
     build: ./frontend
     ports: ["8080:80"]
-    depends_on: [search-service, inventory-service, pharmacy-service]
+    depends_on: [search-service, inventory-service, pharmacy-service, notification-service]
 
   simulator:
     build: ./simulator

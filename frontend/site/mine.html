@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MediFind my reservations</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="/"><span class="cross" aria-hidden="true"></span>MediFind</a>
+    <nav aria-label="Pages">
+      <a href="/">Find medicine</a>
+      <a href="prescription.html">Prescription</a>
+      <a href="mine.html" aria-current="page">My reservations</a>
+      <a href="pharmacy.html">Pharmacy portal</a>
+      <a href="system.html">System view</a>
+    </nav>
+  </header>
+
+  <main>
+    <div class="page-head">
+      <h1>My reservations</h1>
+      <p>Strips you've reserved from this browser. Show the reservation number at the counter before
+         the hold runs out; after that the strip goes back on the shelf for someone else.</p>
+    </div>
+
+    <form class="name-row" id="name-form">
+      <label for="name">Name the pharmacy will see</label>
+      <input id="name" maxlength="50" autocomplete="name">
+      <button class="btn quiet" type="submit">Save</button>
+      <span class="hint" id="name-saved" hidden style="margin:0">Saved.</span>
+    </form>
+
+    <section class="panel" aria-labelledby="h-title">
+      <h2 id="h-title">Being held for you</h2>
+      <p id="h-hint">Loading…</p>
+      <ul class="holds" id="active"></ul>
+    </section>
+
+    <section class="panel" aria-labelledby="w-title">
+      <h2 id="w-title">Medicines you're waiting for</h2>
+      <p>When a pharmacy restocks one of these, an alert appears at the top of every MediFind page.</p>
+      <ul class="watch" id="watch"></ul>
+    </section>
+
+    <section class="panel" aria-labelledby="p-title" style="margin-bottom: 56px">
+      <h2 id="p-title">Earlier reservations</h2>
+      <ul class="holds past" id="past"></ul>
+      <p class="hint" id="past-empty" hidden>Nothing yet.</p>
+    </section>
+  </main>
+</div>
+
+<script src="assets/common.js"></script>
+<script>
+  const $ = (id) => document.getElementById(id);
+  const esc = MF.esc;
+  const user = encodeURIComponent(MF.userId());
+  let reservations = [];
+  let clockOffset = 0;            // server clock minus browser clock, so countdowns match the server
+
+  const STATUS = { active: "Held", cancelled: "Cancelled", expired: "Expired", collected: "Collected" };
+
+  function remaining(r) {
+    return Math.round((MF.utc(r.expires_at).getTime() - (Date.now() + clockOffset)) / 1000);
+  }
+
+  function countdownText(r) {
+    const s = remaining(r);
+    if (s <= 0) return { text: "Hold time is up. Releasing it shortly…", soon: true };
+    const m = Math.floor(s / 60), sec = String(s % 60).padStart(2, "0");
+    return { text: `Held for ${m}:${sec} more, until ${MF.utc(r.expires_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`,
+             soon: s < 120 };
+  }
+
+  function render() {
+    const active = reservations.filter(r => r.status === "active");
+    const past = reservations.filter(r => r.status !== "active");
+    $("h-hint").innerHTML = active.length
+      ? `${active.length} ${active.length === 1 ? "reservation is" : "reservations are"} being held. Cancel any you no longer need so someone else can have it.`
+      : `Nothing is being held right now. <a href="/">Find a medicine</a> and press Reserve.`;
+    $("active").innerHTML = active.map(r => {
+      const c = countdownText(r);
+      return `<li data-id="${r.id}">
+        <div class="code">R-${r.id}</div>
+        <div><div class="what">${r.quantity} ${r.quantity === 1 ? "strip" : "strips"} of ${esc(r.medicine)}</div>
+          <div class="where">${esc(r.pharmacy)}, ${esc(r.area)}</div>
+          <div class="countdown${c.soon ? " soon" : ""}" data-countdown="${r.id}">${c.text}</div></div>
+        <button class="reserve" type="button" data-cancel="${r.id}">Cancel</button>
+      </li>`;
+    }).join("");
+    $("past").innerHTML = past.map(r => `<li>
+        <div class="code">R-${r.id}</div>
+        <div><div class="what">${r.quantity} ${r.quantity === 1 ? "strip" : "strips"} of ${esc(r.medicine)}</div>
+          <div class="where">${esc(r.pharmacy)}, ${esc(r.area)}. Reserved ${MF.timeAgo(r.created_at)}${r.closed_at ? `, ${STATUS[r.status].toLowerCase()} ${MF.timeAgo(r.closed_at)}` : ""}.</div></div>
+        <span class="tag ${r.status}">${STATUS[r.status] || esc(r.status)}</span>
+      </li>`).join("");
+    $("past-empty").hidden = past.length > 0;
+  }
+
+  // Tick the countdowns every second without re-fetching.
+  setInterval(() => {
+    for (const el of document.querySelectorAll("[data-countdown]")) {
+      const r = reservations.find(x => x.id === +el.dataset.countdown);
+      if (!r) continue;
+      const c = countdownText(r);
+      el.textContent = c.text;
+      el.className = "countdown" + (c.soon ? " soon" : "");
+    }
+  }, 1000);
+
+  async function loadReservations() {
+    try {
+      const d = await MF.request("GET", `/inventory/reservations?user_id=${user}`);
+      clockOffset = d.server_time * 1000 - Date.now();
+      reservations = d.reservations;
+      render();
+    } catch (e) {
+      $("h-hint").innerHTML = `<span class="error">Couldn't load your reservations: ${esc(e.message)}</span>`;
+    }
+  }
+
+  async function loadWatch() {
+    try {
+      const { subscriptions } = await MF.request("GET", `/notify/subscriptions?user_id=${user}`);
+      $("watch").innerHTML = subscriptions.length ? subscriptions.map(s => `<li>
+          <span class="tag ${s.status}">${s.status === "waiting" ? "Waiting" : "Back in stock"}</span>
+          <strong>${esc(s.medicine)}</strong>
+          <span class="when">${s.status === "waiting" ? `asked ${MF.timeAgo(s.created_at)}` : `told you ${MF.timeAgo(s.notified_at)}`}</span>
+          ${s.status === "waiting" ? `<button class="link" type="button" data-unwatch="${s.id}">Stop waiting</button>`
+                                   : `<a href="/?medicine=${encodeURIComponent(s.medicine)}">Find it</a>`}
+        </li>`).join("")
+        : `<li class="hint">You're not waiting for anything. When a medicine is sold out everywhere, press "Notify me when it's back".</li>`;
+    } catch (e) {
+      $("watch").innerHTML = `<li class="error">Couldn't load your alerts: ${esc(e.message)}</li>`;
+    }
+  }
+
+  document.addEventListener("click", async (e) => {
+    const cancel = e.target.closest("[data-cancel]");
+    if (cancel) {
+      cancel.disabled = true;
+      cancel.textContent = "Cancelling";
+      try {
+        await MF.request("POST", `/inventory/reservations/${cancel.dataset.cancel}/cancel?user_id=${user}`);
+      } catch (err) {
+        cancel.closest("li").querySelector(".countdown").textContent = `Couldn't cancel: ${err.message}`;
+      }
+      await loadReservations();
+      return;
+    }
+    const unwatch = e.target.closest("[data-unwatch]");
+    if (unwatch) {
+      try { await MF.request("DELETE", `/notify/subscriptions/${unwatch.dataset.unwatch}?user_id=${user}`); } catch {}
+      loadWatch();
+    }
+  });
+
+  $("name").value = MF.customerName() === "Guest" ? "" : MF.customerName();
+  $("name-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    MF.setCustomerName($("name").value);
+    $("name-saved").hidden = false;
+    setTimeout(() => { $("name-saved").hidden = true; }, 2000);
+  });
+
+  loadReservations();
+  loadWatch();
+  setInterval(() => { if (!document.hidden) { loadReservations(); loadWatch(); } }, 5000);
+  MF.startAlerts();
+</script>
+</body>
+</html>

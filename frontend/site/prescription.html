@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MediFind prescription</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="/"><span class="cross" aria-hidden="true"></span>MediFind</a>
+    <nav aria-label="Pages">
+      <a href="/">Find medicine</a>
+      <a href="prescription.html" aria-current="page">Prescription</a>
+      <a href="mine.html">My reservations</a>
+      <a href="pharmacy.html">Pharmacy portal</a>
+      <a href="system.html">System view</a>
+    </nav>
+  </header>
+
+  <main>
+    <div class="page-head">
+      <h1>Fill a whole prescription</h1>
+      <p>Add every medicine on your prescription. MediFind checks all of them at every pharmacy at
+         the same time, then shows where you can get everything, or the fewest stops if no single
+         pharmacy has it all.</p>
+    </div>
+
+    <div class="rx">
+      <form class="rx-add" id="add" autocomplete="off">
+        <input id="med" list="medicine-list" placeholder="Type a medicine, then press Add" minlength="2" maxlength="100"
+               aria-label="Medicine name">
+        <datalist id="medicine-list"></datalist>
+        <button class="btn quiet" type="submit">Add</button>
+      </form>
+      <ul class="chips" id="chips" aria-label="Medicines on your prescription"></ul>
+      <div class="rx-go">
+        <div class="picker">
+          <label for="area">near</label>
+          <select id="area"></select>
+        </div>
+        <button class="btn" id="go" type="button">Find pharmacies</button>
+      </div>
+    </div>
+
+    <p class="status" id="status" aria-live="polite"></p>
+    <div id="out" style="margin-bottom: 56px"></div>
+  </main>
+</div>
+
+<script src="assets/common.js"></script>
+<script>
+  const $ = (id) => document.getElementById(id);
+  const esc = MF.esc;
+  const MAX = 8;
+  let list = [];
+  try { list = JSON.parse(localStorage.getItem("medifind-prescription") || "[]"); } catch { list = []; }
+
+  function save() {
+    try { localStorage.setItem("medifind-prescription", JSON.stringify(list)); } catch {}
+  }
+
+  function renderChips() {
+    $("chips").innerHTML = list.map((m, i) => `<li class="chip">${esc(m)}
+      <button type="button" data-i="${i}" aria-label="Remove ${esc(m)}">×</button></li>`).join("");
+    $("go").disabled = !list.length;
+  }
+
+  function area() {
+    const [lat, lng] = $("area").value.split(",").map(Number);
+    return { name: $("area").selectedOptions[0]?.textContent || "", lat, lng };
+  }
+
+  $("add").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const name = $("med").value.trim();
+    if (name.length < 2) return;
+    if (list.some(m => m.toLowerCase() === name.toLowerCase())) { $("med").value = ""; return; }
+    if (list.length >= MAX) { $("status").textContent = `A prescription search can hold up to ${MAX} medicines.`; return; }
+    list.push(name); save(); renderChips();
+    $("med").value = ""; $("med").focus();
+  });
+
+  $("chips").addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-i]");
+    if (!b) return;
+    list.splice(+b.dataset.i, 1); save(); renderChips();
+  });
+
+  function items(list) {
+    return list.map(i => `${esc(i.medicine)} (${i.quantity})`).join(", ");
+  }
+
+  async function find() {
+    if (!list.length) return;
+    const a = area();
+    $("go").disabled = true;
+    $("status").textContent = "Checking every pharmacy…";
+    try {
+      const d = await MF.request("GET", "/api/prescription?" +
+        new URLSearchParams({ medicines: list.join(","), lat: a.lat, lng: a.lng }));
+      const n = d.medicines.length;
+      $("status").innerHTML = `<b>Checked ${n} ${n === 1 ? "medicine" : "medicines"} at every pharmacy in
+        ${Math.round(d.parallel_ms)} ms</b>, all at the same time.
+        <span class="how">One after another would have taken about ${Math.round(d.one_by_one_ms)} ms.
+        ${d.lookups.map(l => `${esc(l.medicine)}: ${l.source === "cache" ? "cache" : "database"}`).join("; ")}.
+        Answered by ${esc(d.served_by)}.</span>`;
+
+      let html = "";
+      if (d.missing.length) {
+        html += `<div class="missing"><p><b>Nobody has ${d.missing.length === 1 ? "this" : "these"} right now:</b></p><ul>
+          ${d.missing.map(m => `<li>${esc(m)} <button class="link" type="button" data-notify="${esc(m)}">Notify me when it's back</button></li>`).join("")}
+          </ul></div>`;
+      }
+      if (d.all_in_one.length) {
+        html += `<section class="panel"><h2>Everything in one place</h2>
+          <p>${d.all_in_one.length === 1 ? "This pharmacy has" : "These pharmacies have"} every available medicine on your list, nearest first.</p>
+          <ul class="found">${d.all_in_one.map(p => `<li>
+            <div><h3>${esc(p.pharmacy)}</h3>
+              <div class="where">${esc(p.area)}, ${p.distance_km < 0.1 ? "in your area" : `${p.distance_km} km away`}</div>
+              <p class="items">${items(p.items)}</p></div>
+            <button class="reserve" type="button" data-reserve='${esc(JSON.stringify({ id: p.pharmacy_id, name: p.pharmacy, meds: p.items.map(i => i.medicine) }))}'>
+              Reserve all ${p.items.length}</button>
+          </li>`).join("")}</ul></section>`;
+      } else if (d.plan) {
+        const stops = d.plan.stops;
+        html += `<section class="panel"><h2>Fewest stops: ${stops.length} ${stops.length === 1 ? "pharmacy" : "pharmacies"}, ${d.plan.route_km} km in total</h2>
+          <p>No single pharmacy has everything, so this is the shortest trip that gets it all, in the order to visit.</p>
+          <ol class="found">${stops.map((s, i) => `<li>
+            <div><h3><span class="stop-num">${i + 1}</span>${esc(s.pharmacy)}</h3>
+              <div class="where">${esc(s.area)}, ${s.distance_km} km from ${esc(a.name)}</div>
+              <p class="items">Get here: ${items(s.buy)}</p></div>
+            <button class="reserve" type="button" data-reserve='${esc(JSON.stringify({ id: s.pharmacy_id, name: s.pharmacy, meds: s.buy.map(i => i.medicine) }))}'>
+              Reserve ${s.buy.length === 1 ? "it" : `these ${s.buy.length}`}</button>
+          </li>`).join("")}</ol></section>`;
+      }
+      $("out").innerHTML = html;
+    } catch (err) {
+      $("status").innerHTML = `<span class="error">Couldn't check the prescription: ${esc(err.message)}</span>`;
+      $("out").innerHTML = "";
+    } finally {
+      $("go").disabled = !list.length;
+    }
+  }
+
+  // "Reserve all": one reservation per medicine, each taking its own distributed lock.
+  $("out").addEventListener("click", async (e) => {
+    const notifyBtn = e.target.closest("[data-notify]");
+    if (notifyBtn) {
+      try {
+        await MF.subscribe(notifyBtn.dataset.notify, area());
+        notifyBtn.outerHTML = `<span class="hint">Alert set. See it on <a href="mine.html">My reservations</a>.</span>`;
+      } catch (err) { notifyBtn.textContent = `Couldn't set the alert: ${err.message}`; }
+      return;
+    }
+    const btn = e.target.closest("[data-reserve]");
+    if (!btn) return;
+    const job = JSON.parse(btn.dataset.reserve);
+    btn.disabled = true;
+    btn.textContent = "Reserving";
+    const done = [], failed = [];
+    for (const medicine of job.meds) {
+      try {
+        const r = await MF.request("POST", "/inventory/reserve", { pharmacy_id: job.id, medicine, quantity: 1,
+                                    user_id: MF.userId(), customer: MF.customerName() });
+        done.push(`R-${r.reservation_id} ${r.medicine}`);
+      } catch (err) { failed.push(`${medicine} (${err.message})`); }
+    }
+    const li = btn.closest("li");
+    btn.textContent = done.length ? "Reserved" : "Try again";
+    btn.disabled = done.length > 0;
+    li.insertAdjacentHTML("beforeend", `<div class="done${failed.length ? " bad" : ""}">
+      ${done.length ? `Reserved ${esc(done.join(", "))} at ${esc(job.name)}. <a href="mine.html">See my reservations</a>.` : ""}
+      ${failed.length ? ` Couldn't reserve ${esc(failed.join(", "))}.` : ""}</div>`);
+  });
+
+  $("go").addEventListener("click", find);
+
+  (async () => {
+    try {
+      const [meds, areas] = await Promise.all([MF.request("GET", "/api/medicines"), MF.request("GET", "/api/areas")]);
+      $("medicine-list").innerHTML = meds.map(m => `<option value="${esc(m)}">`).join("");
+      $("area").innerHTML = areas.map(a => `<option value="${a.lat},${a.lng}">${esc(a.area)}</option>`).join("");
+    } catch (e) {
+      $("status").innerHTML = `<span class="error">Couldn't reach the search service: ${esc(e.message)}</span>`;
+    }
+    renderChips();
+    MF.startAlerts();
+  })();
+</script>
+</body>
+</html>

@@ -27,8 +27,14 @@ CREATE TABLE IF NOT EXISTS reservations (
     quantity      INT NOT NULL CHECK (quantity > 0),
     customer      VARCHAR(50) NOT NULL DEFAULT 'guest',
     reserved_by   VARCHAR(100),          -- which Inventory pod handled it
+    user_id       VARCHAR(40),           -- the browser that reserved it ("My reservations")
+    status        VARCHAR(12) NOT NULL DEFAULT 'active',   -- active / cancelled / expired / collected
+    expires_at    TIMESTAMP,             -- end of the hold time
+    closed_at     TIMESTAMP,
     created_at    TIMESTAMP NOT NULL DEFAULT NOW()
 );
+-- Restock alerts (subscriptions, notifications) are owned by the Notification
+-- Service, which creates its own tables when it starts.
 
 -- 20 sample pharmacies (coordinates are sample values; change them to your city if you like)
 INSERT INTO pharmacies (name, area, lat, lng) VALUES

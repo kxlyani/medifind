@@ -11,7 +11,7 @@ echo "==> 2/5  Enabling metrics-server (needed by the autoscaler)"
 minikube addons enable metrics-server
 
 echo "==> 3/5  Building images inside Minikube (no Docker Hub push needed)"
-for svc in coordinator inventory-service search-service pharmacy-service simulator frontend; do
+for svc in coordinator inventory-service search-service pharmacy-service notification-service simulator frontend; do
   echo "    building medifind/$svc:1.0"
   minikube image build -t "medifind/$svc:1.0" "./$svc"
 done
